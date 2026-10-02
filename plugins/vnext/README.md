@@ -151,6 +151,16 @@ nothing from it; `interrupt_agent` stops it sooner. Either way the worker's
 blocker says the turn reached its limit. What it wrote stays in the workspace,
 and `retry` continues the same session, so a long job can go on across turns.
 
+When you quit the server, a provider can still send an error for a worker that
+had already finished. The report shows that error as a note under the session.
+The session still counts as a success, so `--failures` leaves it out.
+
+A Claude worker runs a real Claude Code, which starts a vNext server of its own
+in the same project. That server keeps its own session, and the report marks it
+`started inside session`, naming the session it started under. Any other program
+you start from a session carries the same mark. The mark tells you where a
+session began. It does not say who asked for it.
+
 A `provider.error` record in `runs/<session>.jsonl` holds the provider's own words
 about a failure. For a Claude or Z.ai worker it also holds the traceback and the
 bridge's own stderr. That text stays on this machine, beside the workspace it
@@ -181,10 +191,7 @@ fix the credential across restarts.
 
 ## Models
 
-The default catalog is `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6-astra`,
-`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` (Codex), `sonnet`, `opus`, `fable` (Claude),
-`glm-5.3-flash`, `glm-5.3`, `glm-5.2` (Z.ai) and
-`deepseek/deepseek-v4.1-flash` (Command Code).
+`vnext-mcp --check` prints the models this server offers on your machine.
 The root cannot delegate to a model outside the
 catalog its server was started with. Pass `--catalog <path to a catalog JSON
 file>` holding `{"models": [{"provider": "codex", "model": "..."}]}` to change
