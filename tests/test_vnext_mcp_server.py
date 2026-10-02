@@ -133,7 +133,8 @@ class ModelRosterTests(unittest.TestCase):
         roster = server._model_roster([{"provider": "codex", "model": "gpt-6-sol"}])
 
         self.assertEqual(
-            server._MODEL_ROSTER_PREAMBLE + "gpt-6-sol (codex via app-server).",
+            server._MODEL_ROSTER_PREAMBLE + "gpt-6-sol (codex via app-server)."
+            + server._MODEL_ROSTER_EPILOGUE,
             roster,
         )
 

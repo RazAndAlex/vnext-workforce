@@ -935,17 +935,19 @@ class TurnWaitIsAnIdleBudgetTests(unittest.TestCase):
         }
 
         def feed():
-            # Six ticks of work, each arriving after the 0.15s budget would
-            # have expired on its own.  A wall-clock wait dies on the first.
+            # Seven gaps of 0.25s: each well inside the 1s budget, together
+            # 1.75s, so a wall-clock wait dies before the turn completes.  A
+            # 0.05s gap against a 0.15s budget once failed on a loaded GitHub
+            # macOS runner that paused the feeder for longer than the budget.
             for index in range(6):
-                time.sleep(0.05)
+                time.sleep(0.25)
                 with adapter._condition:
                     adapter._events.append({
                         "method": "item/completed",
                         "params": {"threadId": "t1", "turnId": "u1", "index": index},
                     })
                     adapter._condition.notify_all()
-            time.sleep(0.05)
+            time.sleep(0.25)
             with adapter._condition:
                 adapter._events.append(completed)
                 adapter._condition.notify_all()
@@ -955,7 +957,7 @@ class TurnWaitIsAnIdleBudgetTests(unittest.TestCase):
         event = adapter.wait_event(
             lambda value: value.get("method") == "turn/completed",
             cursor=0,
-            timeout=0.15,
+            timeout=1.0,
             progress=lambda value: adapter._belongs_to_turn(value, handle),
         )
         worker.join(timeout=5)

@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from .clock_format import format_time
 from .host_contract import SessionStartRequest
 from .vnext_model_identity import UNKNOWN as EXACT_MODEL_UNKNOWN, resolve_claude_alias
 from .release_check import RELEASE_CODEX_MODEL_COMPATIBILITY, RELEASE_CODEX_VERSION
@@ -188,6 +189,12 @@ _MODEL_ROSTER_PREAMBLE = (
     "from how a person said it is refused. Available model_id values, with the "
     "provider and harness each one runs on: "
 )
+# A client keeps the tool listing it read at its own start, so the roster below
+# can be older than the server answering a delegate.
+_MODEL_ROSTER_EPILOGUE = (
+    " This list was read when this session started; a refusal for an unknown "
+    "model lists what the server offers now."
+)
 
 
 def _model_roster(entries: Sequence[Mapping[str, Any]]) -> str:
@@ -211,7 +218,7 @@ def _model_roster(entries: Sequence[Mapping[str, Any]]) -> str:
             ]
         suffix = f"; {'; '.join(annotations)}" if annotations else ""
         named.append(f"{model} ({runs_on}{suffix})")
-    return _MODEL_ROSTER_PREAMBLE + "; ".join(named) + "."
+    return _MODEL_ROSTER_PREAMBLE + "; ".join(named) + "." + _MODEL_ROSTER_EPILOGUE
 
 
 def _external_tools(
@@ -231,6 +238,94 @@ def _external_tools(
             entry["description"] = str(entry.get("description", "")) + roster
         projected.append(entry)
     return tuple(projected)
+
+# The folder this process imported its vNext code from.  A server keeps the
+# code it started with until restart_server, so a release merged into this
+# folder afterwards is on disk and absent from the process.
+_PACKAGE_FOLDER = Path(__file__).resolve().parent
+# How long one look at the folder is trusted.  The look happens only when an
+# answer needs it (inspect self, an unknown-model refusal), never on a timer.
+_CODE_RECHECK_SECONDS = 5.0
+
+
+def _code_fingerprint(folder: Path) -> tuple[float, int] | None:
+    """Newest modification time and count of the ``.py`` files in ``folder``.
+
+    One stat per file and no hashing.  ``None`` when the folder cannot be read,
+    such as an installed wheel laid out some other way: an unknown answer is
+    treated as "not newer", so the check never invents a restart.
+    """
+
+    try:
+        newest = 0.0
+        count = 0
+        for entry in os.scandir(folder):
+            if entry.name.endswith(".py") and entry.is_file():
+                newest = max(newest, entry.stat().st_mtime)
+                count += 1
+    except OSError:
+        return None
+    return (newest, count) if count else None
+
+
+class CodeFreshness:
+    """Answer whether the vNext code on disk is newer than what this process loaded.
+
+    The fingerprint is taken once at construction and compared, at most once
+    per ``recheck_after`` seconds, with a fresh one.  It only says what
+    changed and which call loads it; restarting stays the caller's decision,
+    because a restart stops the workers that are running.
+    """
+
+    def __init__(
+        self,
+        folder: Path,
+        *,
+        recheck_after: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._folder = Path(folder)
+        self._recheck_after = (
+            _CODE_RECHECK_SECONDS if recheck_after is None else recheck_after
+        )
+        self._clock = clock
+        self.started_at = time.time()
+        self._loaded = self._read()
+        self._checked_at: float | None = None
+        self._newer = False
+        self._lock = threading.Lock()
+
+    def _read(self) -> tuple[float, int] | None:
+        try:
+            return _code_fingerprint(self._folder)
+        except Exception:
+            return None
+
+    def newer_on_disk(self) -> bool:
+        if self._loaded is None:
+            return False
+        with self._lock:
+            now = self._clock()
+            if (
+                self._checked_at is None
+                or now - self._checked_at >= self._recheck_after
+            ):
+                self._checked_at = now
+                current = self._read()
+                self._newer = current is not None and (
+                    current[0] > self._loaded[0] or current[1] != self._loaded[1]
+                )
+            return self._newer
+
+    def stale_notice(self) -> str | None:
+        if not self.newer_on_disk():
+            return None
+        return (
+            "newer vNext code is on disk than this server loaded at "
+            f"{format_time(self.started_at)}; restart_server loads it, "
+            "and running workers stop when it does"
+        )
+
 
 ROOT_INSTRUCTIONS = (
     "You are the Root Manager of a vNext workforce. Delegate bounded work to "
@@ -872,6 +967,7 @@ class VNextMcpService:
         # Children report from the scheduler's threads, not the caller's.
         self._roster_lock = threading.Lock()
 
+        self._code_freshness = CodeFreshness(_PACKAGE_FOLDER)
         active_runtime = read_active_runtime()
         # Shown on inspect when a side runtime runs or a newer release is out.
         # A start never waits on PyPI: it reads the day's cached answer, and
@@ -1325,9 +1421,36 @@ class VNextMcpService:
             result = self.session.external_tool_call(tool=tool, arguments=arguments)
         except Exception as exc:
             return {"success": False, "error": str(exc), "error_code": "external-dispatch"}
-        notice = getattr(self, "_runtime_notice", None)
+        notice = list(getattr(self, "_runtime_notice", None) or ())
+        # The disk is read only for the two answers that carry the sentence.
+        freshness = (
+            getattr(self, "_code_freshness", None)
+            if isinstance(result, ToolCallResult) else None
+        )
+        if (
+            freshness is not None
+            and tool == "inspect"
+            and result.success
+            and arguments.get("agent_id") == "self"
+        ):
+            stale = freshness.stale_notice()
+            if stale:
+                notice.append(stale)
+        if (
+            freshness is not None
+            and tool in {"delegate", "replace"}
+            and not result.success
+            and isinstance(result.value, Mapping)
+            and result.value.get("error_code") == "unknown-model"
+        ):
+            stale = freshness.stale_notice()
+            if stale:
+                error = str(result.value.get("error", ""))
+                return ToolCallResult(
+                    False, {**dict(result.value), "error": f"{error}; {stale}"}
+                )
         if tool == "inspect" and notice and isinstance(result, ToolCallResult) and result.success:
-            return ToolCallResult(True, {**dict(result.value), "runtime": list(notice)})
+            return ToolCallResult(True, {**dict(result.value), "runtime": notice})
         return result
 
     def _record(self, event: Any) -> None:
