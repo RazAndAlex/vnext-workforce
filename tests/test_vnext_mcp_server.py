@@ -26,6 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import suite_environment  # noqa: F401  # the suite settings; unittest never reads conftest.py
 from vnext import vnext_mcp_server as server
 from vnext.vnext_codex_mcp import MCP_PROTOCOL_VERSIONS
 from vnext.vnext_mcp_server import VNextMcpService, VNextMcpServiceError
@@ -92,11 +93,18 @@ class ModelRosterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             (home / "auth.json").write_text('{"tokens":{"access_token":"fixture"}}')
-            # The SDK is an environment fact and this test is about the login
-            # filters, so the harness is held present for both halves.
+            # The SDK and the CLI are environment facts and this test is about
+            # the login filters, so both are held present for both halves: a
+            # runner with no Claude CLI installed read as signed out.
             with patch.object(
                 server, "_claude_sdk_installed", return_value=True
-            ), patch.dict(os.environ, {"CODEX_HOME": str(home)}, clear=True), patch(
+            ), patch.object(
+                server, "_claude_executable", return_value=str(home / "claude")
+            ), patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(home), "HOME": str(home), "USERPROFILE": str(home)},
+                clear=True,
+            ), patch(
                 "vnext.vnext_mcp_server.load_zai_provider", return_value=None
             ), patch(
                 "vnext.vnext_mcp_server.load_commandcode_provider", return_value=None
@@ -2751,7 +2759,9 @@ class RunFolderIsAFileTests(unittest.TestCase):
 
     def test_a_file_where_the_run_folder_goes_still_starts_the_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
+            # The service resolves its workspace, and on Windows that turns a
+            # short 8.3 temp name such as RUNNER~1 into the long one.
+            workspace = Path(temporary).resolve()
             (workspace / ".vnext").write_text("not a folder\n", encoding="utf-8")
             noise = io.StringIO()
             with contextlib.redirect_stderr(noise):
@@ -2994,10 +3004,16 @@ class ClaudeExecutableResolutionTests(unittest.TestCase):
                 "HOME": str(empty_home),
                 "USERPROFILE": str(empty_home),
             }
+            # The module's own platform question is simulated: on a real
+            # Windows host os.name already says "nt", and patching it on a
+            # POSIX host breaks pathlib.
             with patch.dict(os.environ, environment, clear=True), patch.object(
-                os, "name", "nt"
+                server, "_is_windows", return_value=True
             ):
-                self.assertEqual(str(shim), server._claude_executable())
+                found = server._claude_executable()
+            # Windows names the file with the PATHEXT entry's case (claude.CMD);
+            # its file system ignores case, so both name the same shim.
+            self.assertEqual(os.path.normcase(str(shim)), os.path.normcase(found or ""))
 
     def test_simulated_windows_falls_back_to_the_installer_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3019,6 +3035,7 @@ class ClaudeExecutableResolutionTests(unittest.TestCase):
             ):
                 self.assertEqual(str(executable), server._claude_executable())
 
+    @unittest.skipIf(sys.platform == "win32", "the macOS installer layout; Windows has its own cases above")
     def test_a_gui_path_still_finds_the_macos_install(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
@@ -3034,11 +3051,16 @@ class ClaudeExecutableResolutionTests(unittest.TestCase):
     def test_the_login_check_runs_the_resolved_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
-            cli = home / ".claude" / "local" / "claude"
+            name = "claude.exe" if sys.platform == "win32" else "claude"
+            cli = home / ".claude" / "local" / name
             cli.parent.mkdir(parents=True)
             cli.write_text("#!/bin/sh\n", encoding="utf-8")
             cli.chmod(0o755)
-            environment = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home)}
+            environment = {
+                "PATH": str(home / "an-empty-folder"),
+                "HOME": str(home),
+                "USERPROFILE": str(home),
+            }
             with patch.dict(os.environ, environment, clear=True), patch(
                 "subprocess.run",
                 return_value=SimpleNamespace(returncode=0, stdout='{"loggedIn":true}'),
@@ -3783,7 +3805,9 @@ class ClaudeLoginTimeoutTests(unittest.TestCase):
     def test_the_empty_roster_message_says_the_check_did_not_answer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with patch.dict(
-                os.environ, {"CODEX_HOME": temporary}, clear=True
+                os.environ,
+                {"CODEX_HOME": temporary, "HOME": temporary, "USERPROFILE": temporary},
+                clear=True,
             ), patch(
                 "vnext.vnext_mcp_server.load_zai_provider", return_value=None
             ), patch(
@@ -3814,7 +3838,13 @@ class ClaudeLoginTimeoutTests(unittest.TestCase):
             ), patch.object(
                 server, "_claude_sdk_installed", return_value=True
             ), patch("subprocess.run", side_effect=answer), patch.dict(
-                os.environ, {"CODEX_HOME": str(workspace / "no-codex-login")}, clear=True
+                os.environ,
+                {
+                    "CODEX_HOME": str(workspace / "no-codex-login"),
+                    "HOME": str(workspace),
+                    "USERPROFILE": str(workspace),
+                },
+                clear=True,
             ), patch(
                 "vnext.vnext_mcp_server.load_zai_provider", return_value=None
             ), patch(
@@ -3835,9 +3865,16 @@ class ClaudeLoginTimeoutTests(unittest.TestCase):
         self.assertEqual(1, len(answers))
 
 
+_POSIX_FOLDER_MODE = (
+    "a folder's write bit is a POSIX mode; on Windows chmod only sets the "
+    "read-only attribute, which folders ignore"
+)
+
+
 class ReadOnlyRunFolderTests(unittest.TestCase):
     """Round-1 finding 5: a read-only .vnext killed server construction."""
 
+    @unittest.skipIf(sys.platform == "win32", _POSIX_FOLDER_MODE)
     def test_a_read_only_run_folder_still_starts_the_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
@@ -3861,6 +3898,7 @@ class ReadOnlyRunFolderTests(unittest.TestCase):
                 if service is not None:
                     service.close()
 
+    @unittest.skipIf(sys.platform == "win32", _POSIX_FOLDER_MODE)
     def test_an_unwritable_run_folder_still_starts_the_session(self) -> None:
         """Round-4 finding 1: an existing read-only runs/ aborted the service."""
 
@@ -4009,6 +4047,7 @@ class ReadOnlyRunFolderTests(unittest.TestCase):
             self.assertIn("written again", noise.getvalue())
             self.assertEqual(1, len(service._event_log.read_text(encoding="utf-8").splitlines()))
 
+    @unittest.skipIf(sys.platform == "win32", _POSIX_FOLDER_MODE)
     def test_a_roster_and_outcome_log_that_fail_once_heal_on_the_next_write(self) -> None:
         """R20: one refused rename froze the roster with a finished worker running."""
 

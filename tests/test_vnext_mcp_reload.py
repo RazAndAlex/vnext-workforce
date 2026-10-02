@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
+import suite_environment  # noqa: F401  # the suite settings; unittest never reads conftest.py
 from vnext import vnext_mcp_reload
 from vnext.vnext_mcp_reload import (
     _cache_paths,

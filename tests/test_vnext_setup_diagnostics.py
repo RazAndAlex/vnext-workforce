@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import suite_environment  # noqa: F401  # the suite settings; unittest never reads conftest.py
 from vnext import vnext_mcp_server as server
 from vnext import vnext_provider_config as provider_config
 from vnext.vnext_mcp_reload import (
@@ -348,6 +349,10 @@ class RefusedStartTests(unittest.TestCase):
                 server.main(["--workspace", ".", "--stdio"])
 
 
+# pip writes a console script as an .exe launcher on Windows.
+_SCRIPT_SUFFIX = ".exe" if sys.platform == "win32" else ""
+
+
 class ProxyChildNameTests(unittest.TestCase):
     """The proxy names the server after the filename of what it launches."""
 
@@ -360,7 +365,7 @@ class ProxyChildNameTests(unittest.TestCase):
         (reload_root / "package-lock.json").write_bytes(b"lock")
 
     def test_the_installed_console_script_is_preferred(self) -> None:
-        script = Path(sys.executable).with_name("vnext-mcp-server")
+        script = Path(sys.executable).with_name("vnext-mcp-server" + _SCRIPT_SUFFIX)
 
         self.assertEqual(
             [str(script), "--stdio"], _server_child(lambda path: path == script)
@@ -380,7 +385,7 @@ class ProxyChildNameTests(unittest.TestCase):
         )
 
     def test_the_proxy_launches_the_named_script_with_the_server_arguments(self) -> None:
-        script = Path(sys.executable).with_name("vnext-mcp-server")
+        script = Path(sys.executable).with_name("vnext-mcp-server" + _SCRIPT_SUFFIX)
         _, _, entry = _cache_paths(self.plugin_root)
         argv, reason = plan_command(
             self.plugin_root,

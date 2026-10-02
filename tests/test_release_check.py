@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import suite_environment  # noqa: F401  # the suite settings; unittest never reads conftest.py
 from vnext.release_check import (
     PINNED_BUNDLE_SHA256,
     PINNED_BUNDLE_SHA256_DARWIN_ARM64,

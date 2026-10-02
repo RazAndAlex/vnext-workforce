@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import suite_environment  # noqa: F401  # the suite settings; unittest never reads conftest.py
 from vnext import vnext_mcp_server as server
 from vnext import vnext_runtimes as runtimes
 from vnext.live_runtime import resolve_session_runtime
@@ -35,6 +36,23 @@ FAKE_PYPI = {
 }
 
 
+def _write_program(path: Path, output: str) -> Path:
+    """A small program that prints *output* and exits 0.
+
+    Windows cannot start a shell script, so there it is a ``.cmd`` batch file
+    next to *path*, which ``CreateProcess`` runs through ``cmd.exe``.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        program = path.with_name(path.name + ".cmd")
+        program.write_bytes(f"@echo off\r\necho {output}\r\n".encode("utf-8"))
+        return program
+    path.write_text(f"#!/bin/sh\necho '{output}'\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
 class _RuntimesDir(unittest.TestCase):
     def setUp(self) -> None:
         self._temp = tempfile.TemporaryDirectory()
@@ -45,11 +63,7 @@ class _RuntimesDir(unittest.TestCase):
         self.addCleanup(env.stop)
 
     def _fake_codex(self, version: str = "codex-cli 0.159.3") -> Path:
-        exe = self.root / "side" / "codex"
-        exe.parent.mkdir(parents=True, exist_ok=True)
-        exe.write_text(f"#!/bin/sh\necho '{version}'\n", encoding="utf-8")
-        exe.chmod(0o755)
-        return exe
+        return _write_program(self.root / "side" / "codex", version)
 
     def _active(self, **codex_extra) -> dict:
         exe = self._fake_codex()
@@ -290,9 +304,7 @@ class UpdateCommandTests(_RuntimesDir):
 
     def _runner(self, sdk_version: str = "0.2.162"):
         codex = self._fake_codex()
-        cli = self.root / "side" / "claude"
-        cli.write_text("#!/bin/sh\necho '2.1.285 (Claude Code)'\n", encoding="utf-8")
-        cli.chmod(0o755)
+        cli = _write_program(self.root / "side" / "claude", "2.1.285 (Claude Code)")
         calls: list[list[str]] = []
 
         def run(command, timeout=None):

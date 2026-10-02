@@ -419,9 +419,14 @@ def _claude_install_locations() -> tuple[Path, ...]:
     a ``.cmd``. ``~/.claude/local`` is the older local install.
     """
 
-    home = Path.home()
+    try:
+        home: Path | None = Path.home()
+    except RuntimeError:
+        # No HOME, USERPROFILE or password entry: only the folders that do
+        # not hang off the home folder are left to look in.
+        home = None
     if _is_windows():
-        candidates = [
+        candidates = [] if home is None else [
             home / ".local" / "bin" / "claude.exe",
             home / ".local" / "bin" / "claude.cmd",
             home / ".claude" / "local" / "claude.exe",
@@ -434,9 +439,12 @@ def _claude_install_locations() -> tuple[Path, ...]:
                 Path(appdata) / "npm" / "claude.exe",
             ]
         return tuple(candidates)
-    return (
+    in_home = () if home is None else (
         home / ".local" / "bin" / "claude",
         home / ".claude" / "local" / "claude",
+    )
+    return (
+        *in_home,
         Path("/opt/homebrew/bin/claude"),
         Path("/usr/local/bin/claude"),
     )
@@ -541,7 +549,7 @@ def _validate_catalog(
     factories = adapter_factories or {}
     entries: list[dict[str, Any]] = []
     backed = _BUILT_IN_PROVIDERS | set(factories)
-    location = f"--catalog {catalog_path!r}" if catalog_path is not None else "catalog"
+    location = f'--catalog "{catalog_path}"' if catalog_path is not None else "catalog"
     for position, raw in enumerate(catalog, start=1):
         prefix = f"{location}: entry {position}"
         if not isinstance(raw, Mapping):
@@ -828,7 +836,7 @@ class VNextMcpService:
             # its own paths still gets them.
             print(
                 f"vnext: {home} is not a folder this session can make "
-                f"({error}); this session keeps no run records.",
+                f"({getattr(error, 'strerror', None) or error}); this session keeps no run records.",
                 file=sys.stderr,
             )
             home = None
@@ -962,7 +970,7 @@ class VNextMcpService:
             return
         self._failing_writes.add(path)
         print(
-            f"vnext: {path} could not be written ({error}); the next change tries again.",
+            f"vnext: {path} could not be written ({getattr(error, 'strerror', None) or error}); the next change tries again.",
             file=sys.stderr,
         )
 

@@ -21,6 +21,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
+import suite_environment  # noqa: F401  # the suite settings; unittest never reads conftest.py
 from vnext import vnext_mcp_server as server
 from vnext import vnext_runtimes as runtimes
 from vnext.vnext_model_identity import UNKNOWN, identity_view

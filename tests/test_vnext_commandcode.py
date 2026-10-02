@@ -27,6 +27,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import suite_environment  # noqa: F401  # the suite settings; unittest never reads conftest.py
 from vnext.vnext_commandcode import (
     COMMANDCODE_ENDPOINT,
     CommandCodeBridge,

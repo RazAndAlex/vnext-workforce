@@ -973,6 +973,7 @@ class TurnWaitIsAnIdleBudgetTests(unittest.TestCase):
         adapter = self._adapter()
         handle = TurnHandle(thread_id="t1", turn_id="u1", cursor=0)
         stop = threading.Event()
+        appended: list[float] = []
 
         def flood():
             index = 0
@@ -983,6 +984,7 @@ class TurnWaitIsAnIdleBudgetTests(unittest.TestCase):
                         "params": {"threadId": "t2", "turnId": "u2", "index": index},
                     })
                     adapter._condition.notify_all()
+                appended.append(time.monotonic())
                 index += 1
                 time.sleep(0.005)
 
@@ -1001,11 +1003,19 @@ class TurnWaitIsAnIdleBudgetTests(unittest.TestCase):
                 )
         finally:
             stop.set()
-        elapsed = time.monotonic() - started
+        ended = time.monotonic()
+        elapsed = ended - started
         self.assertGreaterEqual(elapsed, 0.2)
         self.assertLess(elapsed, 3.0)
         # The sibling really was talking the whole time; the wait ignored it.
-        self.assertGreater(len(adapter._events), 10)
+        # A count of events depended on how often a loaded runner scheduled
+        # the feeder (8 and 10 on a GitHub macOS runner), so the claim is
+        # checked directly: the sibling was still talking in the second half
+        # of the budget, after any preloaded batch would have drained.
+        self.assertTrue(
+            any(started + 0.1 <= moment <= ended for moment in list(appended)),
+            f"no sibling event in the second half of the wait: {appended}",
+        )
 
     def test_without_progress_the_wait_is_still_wall_clock(self):
         adapter = self._adapter()

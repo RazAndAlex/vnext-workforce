@@ -19,9 +19,15 @@ PREFIX = "[clock]"
 
 
 def format_time(moment: float) -> str:
-    """Render a POSIX timestamp as local wall-clock time, e.g. ``21:14 CEST``."""
+    """Render a POSIX timestamp as local wall-clock time, e.g. ``21:14 CEST``.
 
-    return datetime.datetime.fromtimestamp(moment).astimezone().strftime("%H:%M %Z")
+    The moment is read as UTC and then converted.  A naive local time handed
+    to ``astimezone()`` makes CPython probe the local offset a day earlier,
+    and Windows refuses a time before 1970 with ``OSError: [Errno 22]``.
+    """
+
+    utc = datetime.datetime.fromtimestamp(moment, tz=datetime.timezone.utc)
+    return utc.astimezone().strftime("%H:%M %Z")
 
 
 def format_duration(seconds: float) -> str:

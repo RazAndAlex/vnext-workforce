@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import suite_environment  # noqa: F401  # the suite settings; unittest never reads conftest.py
 from vnext.vnext_claude import (
     ClaudeCodeAdapter,
     ClaudeRuntimeError,

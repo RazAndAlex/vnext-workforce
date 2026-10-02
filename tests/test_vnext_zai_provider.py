@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import suite_environment  # noqa: F401  # the suite settings; unittest never reads conftest.py
 from vnext import vnext_mcp_server as server
 from vnext import vnext_provider_config as provider_config
 from vnext.host_contract import SessionStartRequest

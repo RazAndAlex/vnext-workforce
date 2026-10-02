@@ -68,11 +68,16 @@ KNOWN_PROVIDERS = ("zai", "commandcode")
 
 
 def _display(path: Path) -> str:
-    """The path as the README writes it, with the home folder as ``~``."""
+    """The path as the README writes it, with the home folder as ``~``.
+
+    The README writes forward slashes, so the part under the home folder is
+    shown with them on Windows too.
+    """
 
     try:
-        return f"~/{path.relative_to(Path.home())}"
-    except ValueError:
+        return f"~/{path.relative_to(Path.home()).as_posix()}"
+    except (ValueError, RuntimeError):
+        # Outside the home folder, or no home folder can be named at all.
         return str(path)
 
 

@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
+import suite_environment  # noqa: F401  # the suite settings; unittest never reads conftest.py
 from vnext.vnext_app_server import TurnHandle
 from vnext.vnext_claude import ClaudeRuntimeError
 # The two sides of one approval are tested together on purpose: the bridge
@@ -1757,7 +1758,7 @@ class VNextSchedulerTests(unittest.TestCase):
         self.assertEqual(expected, _clock_line_of(resumed))
 
     def test_wall_clock_step_does_not_change_turn_elapsed(self) -> None:
-        wall = [10_000.0]
+        wall = [1_790_277_360.0]
         monotonic = [100.0]
         scheduler = VNextScheduler(
             managed=self.managed, root=self.root, cancellation=RunCancellation(),
@@ -7556,6 +7557,10 @@ class VNextGateEvidenceTests(unittest.TestCase):
         child_turn = self.managed.start_turn(
             child.agent_id, prompt="branch", effort="high", phase="branch-initial"
         )
+        # time.time() on Windows before Python 3.13 moves in steps of about
+        # 16 ms, so two turns started back to back can share one reading and
+        # overlap for zero seconds.  Let the overlap last longer than a step.
+        time.sleep(0.05)
 
         overlaps = self.managed.concurrent_turn_intervals()
 
