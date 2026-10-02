@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+uv.lock
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local runtime: the diagnostic failure sink lives under data/diagnostics/
+data/
+
+# Session records the server writes into a workspace
+.vnext/
+
+# Guard the exporter writes so it knows this directory is one of its own
+.vnext-export

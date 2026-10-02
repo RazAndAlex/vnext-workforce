@@ -1,0 +1,14 @@
+{
+  "name": "vnext",
+  "owner": {
+    "name": "RazAndAlex"
+  },
+  "description": "An MCP server that lets Claude Code delegate work to Claude, Codex, Z.ai and Command Code workers, and keeps the record",
+  "plugins": [
+    {
+      "name": "vnext",
+      "source": "./plugins/vnext",
+      "description": "Give Claude Code a vNext workforce: delegate bounded work to Codex and Claude workers, await their evidence, and judge it."
+    }
+  ]
+}

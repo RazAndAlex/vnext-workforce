@@ -1,0 +1,11 @@
+{
+  "name": "vnext-reload",
+  "private": true,
+  "description": "Pins the stdio proxy that keeps Claude Code connected while the vNext server restarts.",
+  "dependencies": {
+    "reloaderoo": "1.1.5"
+  },
+  "overrides": {
+    "@modelcontextprotocol/sdk": "1.17.4"
+  }
+}

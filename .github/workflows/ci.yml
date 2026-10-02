@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --group dev -e ".[claude]"
+      - name: Test
+        run: python -m pytest -q
+
+  stranger-install:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install the way the README says
+        run: uv tool install ".[claude]"
+      - name: The command runs
+        shell: bash
+        run: |
+          export PATH="$(uv tool dir --bin):$PATH"
+          vnext-mcp --help
+      - name: The check refuses to start with no logins
+        shell: bash
+        env:
+          VNEXT_RELOAD: "0"
+        run: |
+          export PATH="$(uv tool dir --bin):$PATH"
+          export HOME="$RUNNER_TEMP/stranger-home" USERPROFILE="$RUNNER_TEMP/stranger-home"
+          export CODEX_HOME="$RUNNER_TEMP/stranger-codex" CLAUDE_CONFIG_DIR="$RUNNER_TEMP/stranger-claude"
+          mkdir -p "$HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR"
+          set +e
+          vnext-mcp --check > check.txt 2>&1
+          status=$?
+          set -e
+          cat check.txt
+          test "$status" -ne 0
+          grep -q "at least one available worker model" check.txt

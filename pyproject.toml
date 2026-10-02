@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vnext-workforce"
+version = "0.1.0"
+description = "An MCP server that lets Claude Code delegate work to Claude, Codex, Z.ai and Command Code workers, and keeps the record"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "RazAndAlex", email = "304115303+RazAndAlex@users.noreply.github.com"}]
+dependencies = ["openai-codex==0.160.0", "pywinpty==3.0.5; sys_platform == 'win32'", "websocket-client==1.9.2"]
+
+[project.optional-dependencies]
+claude = ["claude-agent-sdk==0.2.163"]
+
+[project.scripts]
+vnext-mcp = "vnext.vnext_mcp_reload:main"
+vnext-mcp-server = "vnext.vnext_mcp_server:main"
+vnext-report = "vnext.vnext_report:main"
+
+[dependency-groups]
+# pytest-subtests is what reports a failure inside unittest's subTest on pytest
+# 7 and 8. Without it those versions count the suite's subtest failures as
+# nothing at all, so the command the README documents would print a pass over
+# them. pytest 9 reports them itself.
+dev = ["pytest>=7", "pytest-subtests"]
+
+[tool.setuptools.packages.find]
+include = ["vnext*"]
+
+# Four test modules import from tests/, and pytest only puts the directory of
+# each test file on sys.path.  Without this the README's own command exits 2 on
+# a collection error, which is the first thing a stranger runs.  pytest 7 is the
+# release that added the setting, hence the floor in the dev group.
+[tool.pytest.ini_options]
+pythonpath = ["."]

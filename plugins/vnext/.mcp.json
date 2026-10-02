@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "vnext": {
+      "command": "vnext-mcp",
+      "args": [
+        "--plugin-root",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "--",
+        "--workspace",
+        "${CLAUDE_PROJECT_DIR}"
+      ]
+    }
+  }
+}
