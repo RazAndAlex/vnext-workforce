@@ -141,6 +141,11 @@ def project_native_event(provider: str, agent_id: str, event: Mapping[str, Any])
                     "native": dict(message)}, agent_id, turn))
         elif name == "stream":
             result.append(RuntimeEvent("content.delta", {"native": dict(params)}, agent_id, turn))
+        elif name == "system_message":
+            # The CLI's init (slash commands, tools, model) and compact
+            # boundaries, already cut to an allowlist by the bridge.
+            result.append(RuntimeEvent("provider.system", {"provider": provider,
+                "subtype": params.get("subtype"), "data": params.get("data")}, agent_id, turn))
         elif name in {"tool_use", "tool_result"}:
             result.append(RuntimeEvent("tool.lifecycle", {"phase": name, "native": dict(params)}, agent_id, turn))
         elif name == "native_child" and params.get("status") == "dropped-from-identity-join":

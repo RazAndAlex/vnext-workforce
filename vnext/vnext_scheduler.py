@@ -173,6 +173,32 @@ class _TurnFinished:
     error: BaseException | None = None
 
 
+@dataclass(frozen=True)
+class _UnsolicitedTurnEnded:
+    """A turn the provider started by itself, between vNext turns, ended."""
+
+    agent_id: str
+    hook_failures: Mapping[str, Any]
+    blocker: str | None = None
+
+
+def _hook_failure_blocker(value: object) -> str | None:
+    """The blocker for a turn whose last tool calls failed in a hook, or None.
+
+    The bridge reports the trailing run of tool results that failed because a
+    hook timed out or failed.  Such a turn ends normally, so without this the
+    worker sat READY with nobody woken while its parent waited on it.
+    """
+
+    if not isinstance(value, Mapping):
+        return None
+    count = value.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        return None
+    first = str(value.get("first") or "").strip() or "a hook failed"
+    return f"{count} tool calls failed in its last turn: {first}"
+
+
 def _encoded_length(value: Mapping[str, Any]) -> int:
     """How many characters this record costs in a rendered prompt."""
 
@@ -630,6 +656,16 @@ class VNextScheduler:
         # Keep that live agent available for a follow-up instead of spinning a
         # new turn or treating its descriptive role as an instruction to die.
         self._awaiting_message_agents: set[str] = set()
+        # A native Claude Code chat vNext did not start belongs to the user:
+        # every turn prompt is written into its transcript as the user's own
+        # line.  These agents receive the user's text verbatim and nothing
+        # else; vNext guidance rides in the system prompt, peer mail in tool
+        # responses, and a wake with no user text starts no turn.
+        self._raw_prompt_agents: set[str] = set()
+        # A provider-started turn's blocker that arrived while a vNext turn
+        # ran.  That turn's end applies it, since its own result knows nothing
+        # of a turn it did not run.
+        self._deferred_blockers: dict[str, str] = {}
         self._terminal_release_pending: set[str] = set()
         self._idle_notified = False
         self.managed.adapter.native_approval_handler = self.review_approval
@@ -702,6 +738,8 @@ class VNextScheduler:
                 continue
             if isinstance(event, _TurnFinished):
                 self._handle_turn_finished(event)
+            elif isinstance(event, _UnsolicitedTurnEnded):
+                self._handle_unsolicited_turn_ended(event)
             elif event == "cancel":
                 continue
             elif event == "reconnect":
@@ -942,6 +980,33 @@ class VNextScheduler:
         self.hooks.lifecycle("command_acknowledged", agent, {"command": "interrupt_agent", "status": "interrupt-requested"})
         self._events.put("control")
         return {"status": "interrupt-requested", "agent_id": agent_id}
+
+    def compact_agent(self, agent_id: str) -> dict[str, Any]:
+        """Compact an idle agent's provider session.
+
+        The native-control lease holds scheduler starts for the duration, so
+        no managed turn can begin on the thread while the provider compacts.
+        A lease another owner already holds (a native terminal) stays held:
+        this call releases only a lease it acquired itself.
+        """
+
+        with self._lock:
+            already_held = agent_id in self._native_control_leases
+        self.acquire_native_control_lease(agent_id)
+        try:
+            agent = self._session().agents[agent_id]
+            thread_id = self.managed._threads.get(agent_id)
+            compact = getattr(self.managed._adapter_for(agent_id), "compact", None)
+            if not callable(compact):
+                raise ProtocolError("compact-unsupported", "this provider cannot compact a session")
+            if not isinstance(thread_id, str):
+                raise SchedulerError("compact requires a bound runtime thread")
+            result = dict(compact(thread_id, timeout_seconds=self.turn_timeout))
+        finally:
+            if not already_held:
+                self.release_native_control_lease(agent_id)
+        self.hooks.lifecycle("command_acknowledged", agent, {"command": "compact_agent", "status": "compacted", **result})
+        return {**result, "agent_id": agent_id}
 
     def message(self, message: str) -> dict[str, Any]:
         """Deliver a user message to the persistent primary conversation."""
@@ -1196,7 +1261,10 @@ class VNextScheduler:
                 "native-message-unavailable",
                 "the provider did not attest contextual delivery to this native child",
             )
-        self.managed.control.send_user_message(agent_id, text)
+        # A raw-prompt chat keeps the user's text byte for byte.
+        self.managed.control.send_user_message(
+            agent_id, message if agent_id in self._raw_prompt_agents else text
+        )
         self._interrupted_agents.discard(agent_id)
         self._awaiting_message_agents.discard(agent_id)
         self._idle_notified = False
@@ -1216,7 +1284,8 @@ class VNextScheduler:
         text = message.strip()
         if not text:
             raise ValueError("Steering message is required")
-        result = self.message_user(self.root.agent_id, text)
+        # message_user strips again unless the root is a raw-prompt chat.
+        result = self.message_user(self.root.agent_id, message)
         return {**result, "status": "steered", "target": AgentRole.ROOT_MANAGER.value}
 
     def send_message(self, *, sender_id: str, target_id: str, text: str) -> dict[str, Any]:
@@ -1958,7 +2027,7 @@ class VNextScheduler:
         self._events.put("approval")
         with self._lock:
             active_manager_turn = self._active_turns.get(envelope.manager_id)
-        if active_manager_turn is not None:
+        if active_manager_turn is not None and envelope.manager_id not in self._raw_prompt_agents:
             try:
                 self.managed._adapter_for(envelope.manager_id).steer(
                     active_manager_turn.runtime,
@@ -2252,8 +2321,13 @@ class VNextScheduler:
     def _session(self):
         return self.managed.control.sessions[self.managed.session_id]
 
-    def bind_resumed_primary(self, *, provider_session: str) -> None:
-        """Attest an idle primary in a fresh controller, without starting a turn."""
+    def bind_resumed_primary(self, *, provider_session: str, raw_user_prompts: bool = False) -> None:
+        """Attest an idle primary in a fresh controller, without starting a turn.
+
+        ``raw_user_prompts`` marks a native chat vNext did not start: its turns
+        carry only the user's text, so the role guidance and any session
+        instructions go into the system prompt append instead.
+        """
         agent = self.root
         if agent.thread_id is None or agent.status not in {AgentStatus.READY, AgentStatus.COMPLETED}:
             raise SchedulerError("primary has no resumable quiescent thread")
@@ -2272,7 +2346,9 @@ class VNextScheduler:
             model=agent.model_id, effort=agent.effort,
             workspace=str(self.managed.ensure_workspace(agent.agent_id)),
             approvals_reviewer="auto_review", tools=self.manager_tools(),
-            developer_instructions=self._manager_instructions(agent.role),
+            developer_instructions=self._manager_instructions(agent.role) + (
+                self._contract_instructions(agent) if raw_user_prompts else ""
+            ),
             tool_handler=handler,
         )
         identity = adapter.thread_identity_attestation(agent.thread_id)
@@ -2288,6 +2364,8 @@ class VNextScheduler:
         with self._lock:
             self._bound.add(agent.agent_id)
             self._awaiting_message_agents.add(agent.agent_id)
+            if raw_user_prompts:
+                self._raw_prompt_agents.add(agent.agent_id)
             # The historical idle/completion fact is already durable. Only a
             # new user prompt may produce a new objective lifecycle here.
             self._idle_notified = True
@@ -2996,6 +3074,19 @@ class VNextScheduler:
                 continue
             if agent.agent_id in self._interrupted_agents or agent.agent_id in self._awaiting_message_agents:
                 continue
+            if agent.agent_id in self._raw_prompt_agents and not self._has_unread_user_text(agent):
+                # A wake, a peer message or a provider retry has no user text
+                # to send, and anything else would be written into the
+                # user's chat as theirs.  Wait for the user instead.  Children
+                # stay readable through inspect, and peer mail is offered in
+                # the tool responses of the next user turn.
+                self._awaiting_message_agents.add(agent.agent_id)
+                if not self._has_unread_user_text(agent):
+                    continue
+                # message_user queues its text before it clears the parked
+                # set, so a prompt that landed between the read above and the
+                # park is visible now.  Unpark and start it.
+                self._awaiting_message_agents.discard(agent.agent_id)
             deadline = self._retry_not_before.get(agent.agent_id)
             if deadline is not None:
                 # No sleep here on purpose: this loop is single-threaded and a
@@ -3350,6 +3441,7 @@ class VNextScheduler:
                 )
             reconnect_yield = event.agent_id in self._reconnect_interrupts
             self._reconnect_interrupts.discard(event.agent_id)
+        deferred_blocker = self._deferred_blockers.pop(event.agent_id, None)
         # The turn's own replies name the model that really answered.
         finished_agent = self._session().agents.get(event.agent_id)
         if finished_agent is not None:
@@ -3396,9 +3488,26 @@ class VNextScheduler:
             if runtime_status == "interrupted" and event.agent_id in self._interrupted_agents:
                 if agent.status is AgentStatus.RUNNING:
                     self.managed.control.finish_turn(agent.agent_id)
+                if agent.agent_id == self.root.agent_id:
+                    # An interrupted primary waits for the next message like
+                    # one whose turn ended, so the conversation can go idle.
+                    self._awaiting_message_agents.add(agent.agent_id)
                 self.hooks.lifecycle("turn_interrupted", agent, turn_data)
+                if (
+                    deferred_blocker is not None
+                    and agent.status is AgentStatus.READY
+                    and agent.agent_id != self.root.agent_id
+                ):
+                    # The failure waited for this turn's end, and this is it:
+                    # an interrupted worker rests READY, so block it now or
+                    # its parent is never told.
+                    self._block_with_evidence(agent, deferred_blocker)
                 return
             if runtime_status == "interrupted" and reconnect_yield:
+                if deferred_blocker is not None:
+                    # The reconnect starts the worker's next turn; its end
+                    # applies the failure.
+                    self._deferred_blockers.setdefault(event.agent_id, deferred_blocker)
                 return
             used = self._provider_retries.get(agent.agent_id, 0)
             if (
@@ -3440,6 +3549,9 @@ class VNextScheduler:
                         "source_agent_id": agent.agent_id,
                     }],
                 )
+                if deferred_blocker is not None:
+                    # Carried to the retry turn, whose end applies it.
+                    self._deferred_blockers.setdefault(event.agent_id, deferred_blocker)
                 self.hooks.emit(agent, "ready", "turn_retried", line)
                 self._events.put("control")
                 return
@@ -3492,6 +3604,16 @@ class VNextScheduler:
                 self.hooks.lifecycle("agent_terminal", agent,
                     {**turn_data, "status": "completed", "source": "provider-native-task"})
             return
+        blocker = _hook_failure_blocker(result.get("hook_failures")) or deferred_blocker
+        if (
+            blocker is not None
+            and agent.status is AgentStatus.RUNNING
+            and agent.agent_id != self.root.agent_id
+        ):
+            # Its last tool calls never ran, so the turn ended on work it
+            # could not do.  Blocking wakes the parent with the reason.
+            self._block_with_evidence(agent, blocker)
+            return
         if agent.status is AgentStatus.RUNNING:
             self.managed.control.finish_turn(agent.agent_id)
             # A returned native turn is not an implicit completion.  Pause it
@@ -3508,6 +3630,46 @@ class VNextScheduler:
                 "agent_turn_finished",
                 "Agent turn ended without yielding or completing",
             )
+
+    def observe_unsolicited_turn(self, agent_id: str, payload: Mapping[str, Any]) -> None:
+        """Hand the end of a provider-started turn to the scheduler loop.
+
+        Called from the telemetry thread that drains native events, so the
+        decision itself waits for the loop, where every other status change
+        of an agent is made.
+        """
+
+        if payload.get("status") == "reader-ended":
+            # The bridge stopped reading the session between turns, so no
+            # hook or approval of it will be answered again.
+            error = str(payload.get("error") or "stream ended")
+            self._events.put(_UnsolicitedTurnEnded(agent_id, {}, blocker=(
+                f"the Claude session's message stream stopped between turns ({error}); "
+                "nothing answers its hooks or approvals any more"
+            )))
+            return
+        if payload.get("status") != "completed":
+            return
+        failures = payload.get("hook_failures")
+        if _hook_failure_blocker(failures) is None:
+            return
+        self._events.put(_UnsolicitedTurnEnded(agent_id, dict(failures)))  # type: ignore[arg-type]
+
+    def _handle_unsolicited_turn_ended(self, event: _UnsolicitedTurnEnded) -> None:
+        blocker = event.blocker or _hook_failure_blocker(event.hook_failures)
+        agent = self._session().agents.get(event.agent_id)
+        if blocker is None or agent is None or agent.agent_id == self.root.agent_id:
+            return
+        with self._lock:
+            active = event.agent_id in self._active_turns
+        # Only an agent at rest is blocked here.  A vNext turn that started
+        # since owns the agent's status, so the blocker waits for its end.
+        if active or agent.status is AgentStatus.RUNNING:
+            self._deferred_blockers.setdefault(event.agent_id, blocker)
+            return
+        if agent.status is not AgentStatus.READY:
+            return
+        self._block_with_evidence(agent, blocker)
 
     def _manager_handler(
         self,
@@ -3532,7 +3694,8 @@ class VNextScheduler:
             scoped_native_caller = (
                 context is not None
                 and bool(context.turn_id)
-                and self._native_message_delivery(agent_id) == "available"
+                and (self._native_message_delivery(agent_id) == "available"
+                     or agent_id in self._raw_prompt_agents)
             )
             if response.success and (external_caller or scoped_native_caller):
                 session = self._session()
@@ -3570,7 +3733,8 @@ class VNextScheduler:
         scoped_native_caller = (
             context is not None
             and bool(context.turn_id)
-            and self._native_message_delivery(agent_id) == "available"
+            and (self._native_message_delivery(agent_id) == "available"
+                 or agent_id in self._raw_prompt_agents)
         )
         if (tool != "inspect" or arguments.get("agent_id") not in (None, "", "self", agent_id)
                 or not (self._agent_is_external(agent_id) or scoped_native_caller)):
@@ -3727,10 +3891,12 @@ class VNextScheduler:
                 raise ValueError("agent_ids must be a non-empty array")
             # A child named twice is one child: the answer lists it once.
             raw_ids = list(dict.fromkeys(raw_ids))
-            if self._agent_is_external(agent_id):
+            if self._agent_is_external(agent_id) or agent_id in self._raw_prompt_agents:
                 # A client vNext does not run cannot be parked and woken: it is
                 # holding this call open and there is no later turn to deliver
-                # the wake into.  Wait for real instead.
+                # the wake into.  Wait for real instead.  A resumed native chat
+                # is the same case: its only turns are the user's own, so a
+                # wake turn would never come.
                 return self.await_children_blocking(
                     agent_id, raw_ids, timeout=self.external_await_budget
                 )
@@ -4432,7 +4598,45 @@ class VNextScheduler:
         # AWAITING_WORKERS and leaves BLOCKED where it is.
         self.queue_terminal_release(agent.agent_id)
 
+    @staticmethod
+    def _is_user_text(message: Any) -> bool:
+        return message.kind == "user" and message.sender_id == "user"
+
+    def _has_unread_user_text(self, agent: AgentRecord) -> bool:
+        return any(
+            self._is_user_text(item) for item in agent.messages[agent.delivered_message_count:]
+        )
+
+    def _raw_user_prompt(self, agent: AgentRecord) -> tuple[str, str]:
+        """The unread user text of a raw-prompt chat, exactly as typed.
+
+        The unread tail is reordered so the user's messages come first and only
+        they are marked delivered.  Peer mail behind them stays unread and is
+        offered in the next vNext tool response, as for a native child.  An
+        older tool offer no longer describes that tail, so it is withdrawn.
+        """
+
+        wakes = self.managed.control.drain_wakes(agent.agent_id)
+        self._drained_wakes[agent.agent_id] = list(wakes)
+        for wake in wakes:
+            self.hooks.lifecycle(
+                "wake",
+                agent,
+                {"reason": wake.get("reason"), "source_agent": wake.get("source_agent_id")},
+            )
+        session = self._session()
+        with session.lock:
+            offset = agent.delivered_message_count
+            unread = agent.messages[offset:]
+            texts = [item for item in unread if self._is_user_text(item)]
+            agent.messages[offset:] = texts + [item for item in unread if not self._is_user_text(item)]
+            agent.delivered_message_count = offset + len(texts)
+            self._native_messages_offered[agent.agent_id] = agent.delivered_message_count
+        return "\n\n".join(item.text for item in texts), "user-raw"
+
     def _agent_prompt(self, agent: AgentRecord) -> tuple[str, str]:
+        if agent.agent_id in self._raw_prompt_agents:
+            return self._raw_user_prompt(agent)
         self_context = json.dumps(self._self_context(agent), ensure_ascii=False)
         durable_instructions = self._contract_instructions(agent)
         approval = self._approval_for_manager(agent.agent_id)

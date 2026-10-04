@@ -1,0 +1,4 @@
+{
+  "description": "The vnext-session-record hooks module",
+  "modules": ["./register.js"]
+}

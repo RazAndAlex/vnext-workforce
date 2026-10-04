@@ -129,9 +129,12 @@ class VNextMcpReloadTests(unittest.TestCase):
         configuration = json.loads((repository_root / "plugins" / "vnext" / ".mcp.json").read_text())
         server = configuration["mcpServers"]["vnext"]
 
-        self.assertEqual("vnext-mcp", server["command"])
-        self.assertEqual("--plugin-root", server["args"][0])
-        self.assertIn("${CLAUDE_PLUGIN_ROOT}", server["args"])
+        # uv starts the plugin's own launch.py, which finds vnext-mcp by
+        # itself: a bare "vnext-mcp" here failed wherever uv tool install
+        # had never run.
+        self.assertEqual("uv", server["command"])
+        self.assertEqual(["run", "--no-project", "--quiet", "${CLAUDE_PLUGIN_ROOT}/launch.py"], server["args"][:4])
+        self.assertEqual(["--plugin-root", "${CLAUDE_PLUGIN_ROOT}"], server["args"][4:6])
 
     def test_plugin_manifest_uses_installed_cross_platform_entrypoint(self) -> None:
         repository_root = Path(__file__).resolve().parents[1]
@@ -139,12 +142,15 @@ class VNextMcpReloadTests(unittest.TestCase):
         package = tomllib.loads((repository_root / "pyproject.toml").read_text())
         server = manifest["mcpServers"]["vnext"]
 
-        self.assertEqual("vnext-mcp", server["command"])
+        launch = (repository_root / "plugins" / "vnext" / "launch.py").read_text()
+
+        self.assertEqual("uv", server["command"])
+        self.assertIn('LAUNCHER = "vnext-mcp"', launch)
         self.assertEqual(
             "vnext.vnext_mcp_reload:main",
-            package["project"]["scripts"][server["command"]],
+            package["project"]["scripts"]["vnext-mcp"],
         )
-        self.assertEqual("--plugin-root", server["args"][0])
+        self.assertIn("--plugin-root", server["args"])
 
 
 class PluginReadmeTests(unittest.TestCase):

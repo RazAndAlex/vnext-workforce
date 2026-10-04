@@ -315,6 +315,12 @@ _FRAGMENTS: tuple[tuple[str, FailureCategory], ...] = (
     # The provider answered a turn by refusing the login.  It reproduces on
     # every retry, so it is ended at once rather than waited out.
     ("refused the credential", FailureCategory.PROVIDER_CREDENTIAL_REJECTED),
+    # Compact sends /compact through an idle reservation.  A busy reservation
+    # can retry later; an answer without a compact boundary means the CLI
+    # treated it as an ordinary prompt and cannot compact.
+    ("compact was not exactly correlated", FailureCategory.BRIDGE_PROTOCOL_VIOLATION),
+    ("compact requires an idle connected", FailureCategory.EFFECT_STATE_EXHAUSTED),
+    ("did not report a compact boundary", FailureCategory.UNSUPPORTED_OPERATION),
 )
 
 # Exception classes that identify a category on their own.  Used for the

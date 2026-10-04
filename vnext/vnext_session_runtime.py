@@ -466,16 +466,42 @@ class VNextRuntimeSession:
         This deliberately performs no provider operation.  It preserves durable
         agent IDs and lineage so history and map replay stay coherent, while
         leaving provider controls unavailable until an adapter can re-attest a
-        live thread.  A running turn, waiter, or blocked agent is not a
-        quiescent tree and must use the provider reconciliation path instead.
+        live thread.  A root that was mid-turn loses that turn and comes back
+        ready; a running, waiting, or blocked child is not a quiescent tree
+        and must use the provider reconciliation path instead.
         """
 
         if request.start != self.request:
             raise ValueError("restored session identity does not match this runtime")
-        if request.status not in {"ready", "idle", "completed", "cancelled", "failed"}:
-            raise ValueError("active session requires provider reconciliation")
-        self.control.restore_terminal_tree(self.root.session_id, list(request.agents))
-        self._restored_agents = {str(item["agent_id"]): dict(item) for item in request.agents}
+        agents = [dict(item) for item in request.agents]
+        dropped_turn_id = None
+        terminal = {status.value for status in TERMINAL_STATUSES}
+        saved_root = next((item for item in agents if item.get("agent_id") == self.root.agent_id), None)
+        root_status = saved_root.get("status") if saved_root is not None else None
+        root_terminal = root_status in terminal
+        session_active = request.status not in {"ready", "idle", "completed", "cancelled", "failed"}
+        # Decide from the root record.  The session row is persisted in a
+        # separate transaction, so a crash can leave session=idle beside a
+        # mid-turn root, or session=running beside a root already cancelled.
+        active = saved_root is not None and not root_terminal and (
+            saved_root.get("turn_id") is not None or root_status == "running" or session_active
+        )
+        if active or (session_active and root_terminal):
+            # Any child still at work needs the provider reconciliation path.
+            for item in agents:
+                if item is saved_root:
+                    continue
+                if item.get("turn_id") is not None or item.get("status") not in terminal:
+                    raise ValueError("active session requires provider reconciliation")
+        if active:
+            # Only a root that died mid-turn is recoverable here: its provider
+            # process is gone, so the turn is dropped and the root comes back
+            # ready on the same thread.  A terminal root is never revived.
+            dropped_turn_id = saved_root.get("turn_id")
+            saved_root["turn_id"] = None
+            saved_root["status"] = "ready"
+        self.control.restore_terminal_tree(self.root.session_id, agents)
+        self._restored_agents = {str(item["agent_id"]): item for item in agents}
         self.root = self.control.sessions[self.root.session_id].agents[self.root.agent_id]
         for agent in self.control.sessions[self.root.session_id].agents.values():
             saved = self._restored_agents[agent.agent_id]
@@ -483,7 +509,21 @@ class VNextRuntimeSession:
                 agent.usage = dict(saved["usage"])
             if isinstance(saved.get("result"), Mapping):
                 agent.result = dict(saved["result"])
-        self._status = request.status
+        if active:
+            self._status = "idle"
+        elif session_active and root_terminal:
+            # The root's own terminal status outranks a stale running row.
+            self._status = str(root_status)
+        else:
+            self._status = request.status
+        restoration: dict[str, Any] = {
+            "state": "quiescent-tree-restored",
+            "cursor": request.cursor,
+            "provider_controls": "unavailable-pending-attestation",
+        }
+        if active:
+            restoration["state"] = "interrupted-turn-restored"
+            restoration["dropped_turn_id"] = dropped_turn_id
         views = []
         for agent in self.control.sessions[self.root.session_id].agents.values():
             view = self._agent_view(agent)
@@ -494,11 +534,7 @@ class VNextRuntimeSession:
             "primary_agent_id": self.root.agent_id,
             "agents": views,
             "capabilities": self._restored_session_capabilities(),
-            "restoration": {
-                "state": "quiescent-tree-restored",
-                "cursor": request.cursor,
-                "provider_controls": "unavailable-pending-attestation",
-            },
+            "restoration": restoration,
         }
 
     @staticmethod
@@ -544,9 +580,42 @@ class VNextRuntimeSession:
         if self.root.effort != self.request.primary.get("effort", "high"):
             raise ValueError("saved primary effort differs from session selection")
         scheduler = self._prepare_scheduler()
-        scheduler.bind_resumed_primary(provider_session=saved["native_session_id"])
+        # A native chat's root record says so, which keeps the user's text
+        # verbatim after a host restart too.
+        scheduler.bind_resumed_primary(provider_session=saved["native_session_id"],
+                                       raw_user_prompts=saved.get("raw_user_prompts") is True)
         self._primary_resumed = True
         return self._resumed_snapshot()
+
+    def resume_native_primary(self, native_session_id: str) -> Mapping[str, Any]:
+        """Make a native Claude Code session this fresh session's root.
+
+        The native id is both the runtime thread and the provider session, as
+        in ``ClaudeCodeAdapter.resume_thread``, so the bridge's ``resume`` op
+        takes it with no prior reservation.  The host has already checked that
+        the session was written in this workspace.
+        """
+        if not isinstance(native_session_id, str) or not native_session_id:
+            raise ValueError("native session resume requires a session id")
+        with self._lock:
+            if (self._shutdown.is_set() or self._thread is not None
+                    or self._restored_agents or self._primary_resumed):
+                raise ValueError("native session resume requires a fresh runtime")
+        if self.registry.cards[self.root.model_id].provider != "claude":
+            raise ValueError("native session resume is only available for Claude")
+        self.control.attach_runtime_thread(self.root.agent_id, native_session_id)
+        self._restored_agents = {self.root.agent_id: {
+            "agent_id": self.root.agent_id, "native_session_id": native_session_id,
+            "raw_user_prompts": True}}
+        scheduler = self._prepare_scheduler()
+        # The chat is the user's: each prompt lands in its transcript as their
+        # line, so it carries their text alone.
+        scheduler.bind_resumed_primary(provider_session=native_session_id, raw_user_prompts=True)
+        self._primary_resumed = True
+        self._status = "idle"
+        return {**self._resumed_snapshot(),
+                "restoration": {"state": "native-session-resumed",
+                                "provider_controls": "primary-resume-configured"}}
 
     def _resumed_snapshot(self) -> Mapping[str, Any]:
         capabilities = self._restored_session_capabilities()
@@ -592,7 +661,8 @@ class VNextRuntimeSession:
                     bridge_command = side_runtime_bridge_command(side)
                 adapter = ClaudeCodeAdapter(workspace=str(self.workspace), provider=provider,
                     bridge_command=bridge_command,
-                    permission_mode=str(self.request.config.get("claude_permission_mode", "default")))
+                    permission_mode=str(self.request.config.get("claude_permission_mode", "default")),
+                    tool_inputs=self.request.config.get("claude_tool_inputs") is True)
             elif provider == "external":
                 from .vnext_external_primary import ExternalPrimaryAdapter
                 adapter = ExternalPrimaryAdapter(
@@ -1233,6 +1303,10 @@ class VNextRuntimeSession:
         result = self._require_scheduler().interrupt_agent(agent_id)
         return dict(result or {"interrupted": True, "agent_id": agent_id})
 
+    def compact(self, agent_id: str, command_id: str) -> Mapping[str, Any]:
+        self._require_agent(agent_id)
+        return self._require_scheduler().compact_agent(agent_id)
+
     def cancel(self, agent_ids: Sequence[str] | None, command_id: str) -> Mapping[str, Any]:
         if agent_ids is None:
             self._status = "completed" if self._clean_close else "cancelled"
@@ -1350,6 +1424,9 @@ class VNextRuntimeSession:
             "usage": dict(agent.usage) or saved.get("usage"),
             "result": dict(agent.result) or saved.get("result", {}),
             "capabilities": capabilities}
+        if saved.get("raw_user_prompts") is True:
+            # Persisted on the root's record, so a restored runtime sees it.
+            view["raw_user_prompts"] = True
         # Why an agent stopped is the one thing a blocked roster row has to
         # say.  The field was set on the record and dropped here, so a run
         # journal held 33 blocked workers and not one reason.  The key
@@ -1604,6 +1681,10 @@ class VNextRuntimeSession:
                 else:
                     return 1
             return 0
+        if params.get("name") == "unsolicited_turn" and self._scheduler is not None:
+            # No vNext turn waits on a turn the provider started by itself,
+            # so this drain is the only reader that sees how it ended.
+            self._scheduler.observe_unsolicited_turn(agent_id, params)
         native_turn = self._native_turn_id(params)
         if self._is_native_turn_started(event, params) and native_turn and self._scheduler is not None:
             try:

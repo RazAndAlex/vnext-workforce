@@ -162,6 +162,10 @@ class ClaudeRuntimeError(RuntimeError):
 
 
 _DEFAULT_BRIDGE_MODULE = "vnext.vnext_claude_bridge"
+# /compact is a model call over the whole transcript.  It gets the scheduler's
+# default turn budget (VNextScheduler.turn_timeout), never the short control
+# request timeout: a compact cut off early leaves the bridge reader busy.
+_COMPACT_TIMEOUT_SECONDS = 1800.0
 
 # The neutral effects this boundary may forward to the approval reviewer.
 # `review_approval` in vnext_scheduler branches on exactly these four, and
@@ -272,6 +276,23 @@ def _fatal_code(message: object) -> str | None:
     return fixed.get(message) if isinstance(message, str) else None
 
 
+def _require_sdk_permission_mode(permission_mode: object, scope: str) -> None:
+    """Accept the SDK modes that still route each tool call through vNext.
+
+    bypassPermissions and auto approve calls before the SDK consults
+    can_use_tool, the callback the bridge uses for approvals, native-child
+    refusal and effect records, so an SDK session never runs in them.
+    """
+
+    if permission_mode in {"bypassPermissions", "auto"}:
+        raise ClaudeRuntimeError(
+            f"permission mode is not supported by vNext for a Claude {scope}: "
+            f"{permission_mode} skips can_use_tool, which carries vNext approvals"
+        )
+    if permission_mode not in {"default", "acceptEdits", "plan"}:
+        raise ClaudeRuntimeError(f"permission mode is not supported by vNext for a Claude {scope}")
+
+
 def _validated_tool_definitions(tools: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Return caller tool definitions the bridge is allowed to host.
 
@@ -335,6 +356,7 @@ class ClaudeCodeAdapter:
         request_timeout_seconds: float = 15.0,
         permission_mode: str = "default",
         provider: str = "claude",
+        tool_inputs: bool = False,
     ) -> None:
         started = time.monotonic()
         resolved = Path(workspace).resolve()
@@ -359,9 +381,11 @@ class ClaudeCodeAdapter:
             raise ClaudeRuntimeError("Claude adapter provider is not supported by vNext")
         self.provider = provider
         self._endpoint_attestation: dict[str, Any] = {}
-        if permission_mode not in {"default", "acceptEdits"}:
-            raise ClaudeRuntimeError("Claude adapter permission mode is not supported by vNext")
+        _require_sdk_permission_mode(permission_mode, "adapter")
         self._permission_mode = permission_mode
+        # Session opt-in (claude_tool_inputs): the bridge copies tool_use
+        # arguments into message events, which the run log keeps on disk.
+        self._tool_inputs = tool_inputs is True
         # A default launch is source-pinned before it imports the bridge.  The
         # workspace stays the bridge CWD for its normal workspace contract,
         # while an explicit command remains wholly caller-controlled.
@@ -543,8 +567,7 @@ class ClaudeCodeAdapter:
         if effort not in CLAUDE_ACCEPTED_EFFORTS:
             raise ClaudeRuntimeError("Claude thread effort is not supported by the SDK")
         permission_mode = self._permission_mode if permission_mode is None else permission_mode
-        if permission_mode not in {"default", "acceptEdits"}:
-            raise ClaudeRuntimeError("Claude thread permission mode is not supported by vNext")
+        _require_sdk_permission_mode(permission_mode, "thread")
         posture = requested_posture.as_dict()
         if (
             posture.get("workspace_writes") is not True
@@ -570,6 +593,7 @@ class ClaudeCodeAdapter:
                 "effort": effort,
                 "permission_mode": permission_mode,
                 "reservation_id": reservation_id,
+                **self._tool_inputs_payload(),
             },
             timeout_seconds=self._start_thread_timeout,
         )
@@ -624,6 +648,10 @@ class ClaudeCodeAdapter:
         self._tool_registrations[reservation_id] = dict(registration)
         self._note_model_identity(reservation_id, model, result.get("model_identity"))
         return reservation_id, policy
+
+    def _tool_inputs_payload(self) -> dict[str, bool]:
+        # Absent unless set, so a default session sends the same request as before.
+        return {"tool_inputs": True} if self._tool_inputs else {}
 
     def _note_model_identity(self, thread_id: str, alias: str, reported: object) -> None:
         """Keep the bridge's exact-model answer beside the alias it resolved."""
@@ -965,6 +993,7 @@ class ClaudeCodeAdapter:
             ).as_dict(),
             "model": state["model"], "effort": state["effort"],
             "permission_mode": state["permission_mode"],
+            **self._tool_inputs_payload(),
         })
         if result.get("reservation_echo") != thread_id or result.get("connection_evidence") != {"connected": True, "server_info_received": True}:
             raise ClaudeRuntimeError("Claude restart did not attest its local reservation")
@@ -993,8 +1022,10 @@ class ClaudeCodeAdapter:
             # The initial prompt cannot overlap an earlier reader. Every
             # later generation must ask the bridge, even when no native child
             # was adopted: the primary terminal wakes its waiter before the
-            # sole reader's ``finally`` clears bridge-local state.
-            if generation == 0:
+            # sole reader's ``finally`` clears bridge-local state.  A compact
+            # that outlived its wait may still hold that reader.
+            compact_unsettled = state.get("compact_unsettled") is True
+            if generation == 0 and not compact_unsettled:
                 return True
             child_tasks = [
                 task for task in self._native_child_tasks.values()
@@ -1032,6 +1063,8 @@ class ClaudeCodeAdapter:
             raise ClaudeRuntimeError("Claude bridge readiness lacks exact local correlation")
         with self._condition:
             self._turn_readiness[thread_id] = (generation, ready, time.monotonic())
+            if ready and compact_unsettled and isinstance(state, dict):
+                state["compact_unsettled"] = False
         return ready
 
     def wait_turn(
@@ -1137,6 +1170,31 @@ class ClaudeCodeAdapter:
         if isinstance(state, dict) and state.get("active_turn") == handle.turn_id:
             state["active_turn"] = None
         return result
+
+    def compact(self, runtime_thread: str, *, timeout_seconds: float | None = None) -> Mapping[str, Any]:
+        """Compact an idle Claude session through the bridge's ``/compact`` op.
+
+        Compaction is a model call as long as a turn, so it waits as long as
+        one.  If the wait still ends early, the bridge may keep its sole
+        reader: the thread is marked so can_start_turn asks the bridge until
+        the bridge reports the reader free, and no prompt starts into it.
+        """
+
+        if runtime_thread in self._terminal_leases:
+            raise ClaudeRuntimeError("Claude compact is unavailable while terminal owns the session")
+        state = self._threads.get(runtime_thread)
+        if isinstance(state, dict):
+            state["compact_unsettled"] = True
+        result = self._request(
+            "compact",
+            {"reservation_id": runtime_thread},
+            timeout_seconds=_COMPACT_TIMEOUT_SECONDS if timeout_seconds is None else max(timeout_seconds, _COMPACT_TIMEOUT_SECONDS),
+        )
+        if isinstance(state, dict):
+            state["compact_unsettled"] = False
+        if result.get("reservation_echo") != runtime_thread or result.get("compacted") is not True:
+            raise ClaudeRuntimeError("Claude compact was not exactly correlated")
+        return {key: result[key] for key in ("compacted", "trigger", "pre_tokens", "post_tokens") if key in result}
 
     def begin_native_terminal(
         self,
@@ -2095,8 +2153,7 @@ class ClaudeCodeAdapter:
             if permission_mode is None and isinstance(existing, Mapping)
             else self._permission_mode if permission_mode is None else permission_mode
         )
-        if permission_mode not in {"default", "acceptEdits"}:
-            raise ClaudeRuntimeError("Claude resume permission mode is not supported by vNext")
+        _require_sdk_permission_mode(permission_mode, "resume")
         # A normal in-process reconnect can reuse the registration retained by
         # this adapter.  A fresh controller has no such cache, so its caller
         # must replay the deterministic manager definitions explicitly.  Do
@@ -2139,6 +2196,7 @@ class ClaudeCodeAdapter:
                 "effort": effort,
                 "permission_mode": permission_mode,
                 "requested_posture": requested_posture.as_dict(),
+                **self._tool_inputs_payload(),
             },
         )
         registration = result.get("tool_registration")
@@ -2591,7 +2649,7 @@ class ClaudeCodeAdapter:
             "message", "usage", "stream", "native_child", "native_child_identity",
             "native_child_usage", "native_child_completed", "native_child_stop", "native_child_control", "provider_error",
             "native_child_counters",
-            "stream_deltas_dropped",
+            "stream_deltas_dropped", "system_message", "unsolicited_turn",
         }:
             self._set_fatal("Claude bridge emitted an unsupported event")
             return

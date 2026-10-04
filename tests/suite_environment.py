@@ -16,7 +16,51 @@ import os
 import tempfile
 from pathlib import Path
 
-import vnext.vnext_runtimes as _runtimes
+# No test writes into the developer's real home: ~/.vnext, ~/.vnext,
+# ~/.cache and the rest resolve inside a folder only this run uses.  HOME is
+# set before any vnext import, because some modules read it once.
+_SUITE_HOME_ENV = "VNEXT_TEST_SUITE_HOME"
+
+
+def _pin_uv_dirs():
+    # uv's package cache and managed Pythons are shared tool state, not vNext
+    # state.  Pin them to the real locations before HOME moves, or a test that
+    # starts the plugin through `uv run` downloads everything again (minutes).
+    import shutil
+    import subprocess
+
+    uv = shutil.which("uv")
+    if not uv:
+        return
+    for name, args in (("UV_CACHE_DIR", ["cache", "dir"]), ("UV_PYTHON_INSTALL_DIR", ["python", "dir"])):
+        if os.environ.get(name):
+            continue
+        try:
+            out = subprocess.run([uv, *args], capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out:
+            os.environ[name] = out
+
+
+if not os.environ.get(_SUITE_HOME_ENV):
+    _pin_uv_dirs()
+if not os.environ.get(_SUITE_HOME_ENV):
+    os.environ[_SUITE_HOME_ENV] = tempfile.mkdtemp(prefix="vnext-test-home-")
+os.environ["HOME"] = os.environ[_SUITE_HOME_ENV]
+os.environ["USERPROFILE"] = os.environ["HOME"]  # Path.home() on Windows
+for _name, _relative in (
+    ("XDG_CONFIG_HOME", ".config"),
+    ("XDG_CACHE_HOME", ".cache"),
+    ("XDG_DATA_HOME", ".local/share"),
+    ("XDG_STATE_HOME", ".local/state"),
+    ("CODEX_HOME", ".codex"),
+    ("CLAUDE_CONFIG_DIR", ".claude"),
+):
+    os.environ[_name] = os.path.join(os.environ["HOME"], _relative)
+TEST_HOME = os.environ["HOME"]
+
+import vnext.vnext_runtimes as _runtimes  # noqa: E402
 
 os.environ["VNEXT_CHECK_SKIP_MODEL_PROBE"] = "1"
 

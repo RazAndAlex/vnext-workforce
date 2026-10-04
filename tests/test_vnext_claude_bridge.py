@@ -960,6 +960,16 @@ class ClaudeOwnedBridgeTests(unittest.TestCase):
         self.assertTrue(adapter.interrupt(handle)["interrupted"])
         self.assert_clean(adapter)
 
+    def test_compact_round_trips_through_the_owned_bridge(self) -> None:
+        adapter = self.adapter()
+        adapter.initialize()
+        thread_id, _ = self.start_thread(adapter)
+        self.assertEqual(
+            {"compacted": True, "trigger": "manual", "pre_tokens": 15919, "post_tokens": 1999},
+            dict(adapter.compact(thread_id)),
+        )
+        self.assert_clean(adapter)
+
     def test_init_failure_cleanup(self) -> None:
         adapter = self.adapter("init-failure")
         with self.assertRaisesRegex(ClaudeRuntimeError, "fixture init failure"):
@@ -1216,6 +1226,23 @@ class ClaudeOwnedBridgeTests(unittest.TestCase):
 
         self.assertEqual(2, len(effects.records("claude-agent")))
         self.assertEqual(0, effects.summary("claude-agent")["uncorrelated_item_count"])
+        self.assert_clean(adapter)
+
+    def test_system_message_event_reaches_the_runtime_projection(self) -> None:
+        from vnext.vnext_runtime_projection import project_native_event
+
+        adapter = self.adapter("system-message")
+        adapter.initialize()
+        thread_id, _ = self.start_thread(adapter)
+        handle = adapter.start_turn(thread_id, "init fixture turn")
+        self.assertEqual("completed", adapter.wait_turn(handle)["status"])
+        events = [event for event in adapter.events_since(handle.cursor) if event["name"] == "system_message"]
+        self.assertEqual(1, len(events))
+        projected = [item for item in project_native_event("claude", "root", events[0])
+                     if item.type == "provider.system"]
+        self.assertEqual(1, len(projected))
+        self.assertEqual("init", projected[0].payload["subtype"])
+        self.assertEqual(["compact", "context"], projected[0].payload["data"]["slash_commands"])
         self.assert_clean(adapter)
 
     def test_fake_sdk_reservation_then_first_turn_binds_emitted_identity(self) -> None:
@@ -2087,6 +2114,189 @@ class ClaudeOwnedBridgeTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_compact_sends_slash_compact_through_the_idle_reservation_client(self) -> None:
+        """The SDK has no compact method; the CLI runs /compact sent as a prompt."""
+
+        class SystemMessage:
+            def __init__(self, subtype: str, data: dict) -> None:
+                self.subtype, self.data = subtype, data
+
+        class ResultMessage:
+            session_id, result, is_error, subtype = "native-session", "", False, "success"
+
+        boundary = SystemMessage("compact_boundary", {"compact_metadata": {
+            "trigger": "manual", "pre_tokens": 15919, "post_tokens": 1999,
+        }})
+
+        class Client:
+            def __init__(self, messages: list) -> None:
+                self.messages, self.prompts = messages, []
+
+            async def query(self, prompt: str) -> None:
+                self.prompts.append(prompt)
+
+            async def receive_messages(self):
+                for message in self.messages:
+                    yield message
+
+        async def exercise() -> None:
+            bridge = _Bridge()
+            bridge._workspace, bridge._sdk = Path(self.workspace), object()
+            state = bridge._reservation_state("auto_review", "native-session", [])
+            client = Client([SystemMessage("status", {}), boundary, ResultMessage()])
+            state["client"] = client
+            bridge._reservations["reservation-a"] = state
+            result = await bridge.dispatch("compact", {"reservation_id": "reservation-a"})
+            self.assertEqual(["/compact"], client.prompts)
+            self.assertEqual(
+                {"reservation_echo": "reservation-a", "compacted": True,
+                 "trigger": "manual", "pre_tokens": 15919, "post_tokens": 1999},
+                dict(result),
+            )
+            self.assertIsNone(state["task"])
+            self.assertEqual(0, state["generation"])
+            # No boundary means the CLI answered as an ordinary prompt.
+            state["client"] = Client([ResultMessage()])
+            with self.assertRaisesRegex(BridgeError, "compact boundary"):
+                await bridge.dispatch("compact", {"reservation_id": "reservation-a"})
+            self.assertIsNone(state["task"])
+            # A live reader owns receive_messages; compact must not race it.
+            state["task"] = asyncio.get_running_loop().create_future()
+            with self.assertRaisesRegex(BridgeError, "idle"):
+                await bridge.dispatch("compact", {"reservation_id": "reservation-a"})
+            state["task"].cancel()
+
+        asyncio.run(exercise())
+
+    def test_compact_emits_the_boundary_and_the_result_usage_as_events(self) -> None:
+        """the host sees the compact the way it sees any turn: provider.system and usage."""
+
+        class SystemMessage:
+            subtype = "compact_boundary"
+            data = {"session_id": "native-session", "cwd": "/private/path",
+                    "compact_metadata": {"trigger": "manual", "pre_tokens": 15919, "post_tokens": 1999}}
+
+        class ResultMessage:
+            session_id, result = "native-session", ""
+            usage = {"input_tokens": 3, "output_tokens": 120, "cache_read_input_tokens": 1999}
+            total_cost_usd, model_usage = 0.01, None
+            duration_ms = duration_api_ms = num_turns = None
+            is_error, stop_reason, subtype = False, None, "success"
+            api_error_status, terminal_reason, errors = None, None, ()
+
+        class Client:
+            async def query(self, _prompt: str) -> None:
+                pass
+
+            async def receive_messages(self):
+                yield SystemMessage()
+                yield ResultMessage()
+
+        bridge = _Bridge()
+        bridge._workspace, bridge._sdk = Path(self.workspace), object()
+        state = bridge._reservation_state("auto_review", "native-session", [])
+        state["client"] = Client()
+        bridge._reservations["reservation-a"] = state
+        stdout = io.StringIO()
+        with patch("sys.stdout", stdout):
+            result = asyncio.run(bridge.dispatch("compact", {"reservation_id": "reservation-a"}))
+        self.assertIs(True, result["compacted"])
+        events = [json.loads(line)["event"] for line in stdout.getvalue().splitlines()]
+        boundary = [event for event in events if event["name"] == "system_message"]
+        self.assertEqual(1, len(boundary))
+        self.assertEqual("compact_boundary", boundary[0]["subtype"])
+        self.assertEqual({"trigger": "manual", "pre_tokens": 15919}, boundary[0]["data"]["compact_metadata"])
+        self.assertNotIn("cwd", boundary[0]["data"])
+        usage = [event for event in events if event["name"] == "usage"]
+        self.assertEqual(1, len(usage))
+        self.assertEqual(ResultMessage.usage, usage[0]["usage"])
+        self.assertEqual(0.01, usage[0]["total_cost_usd"])
+        self.assertEqual(len(events), bridge._event_cursor)
+
+    def test_a_timed_out_compact_holds_the_next_prompt_until_the_bridge_is_free(self) -> None:
+        """A compact slower than its RPC timeout must not let a prompt fail the session.
+
+        The adapter runs against a real in-process bridge.  Compact keeps the
+        bridge's sole reader after the adapter stops waiting, and a freshly
+        resumed thread (generation 0) used to skip the bridge readiness check,
+        so start_turn hit the bridge's busy reservation and raised.
+        """
+
+        import concurrent.futures
+
+        class SystemMessage:
+            subtype = "compact_boundary"
+            data = {"session_id": "native-session", "compact_metadata": {"trigger": "manual", "pre_tokens": 9}}
+
+        class ResultMessage:
+            session_id, result = "native-session", ""
+            usage = total_cost_usd = model_usage = None
+            duration_ms = duration_api_ms = num_turns = None
+            is_error, stop_reason, subtype = False, None, "success"
+            api_error_status, terminal_reason, errors = None, None, ()
+
+        release_compact = threading.Event()
+
+        class Client:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            async def query(self, prompt: str) -> None:
+                self.prompts.append(prompt)
+
+            async def receive_messages(self):
+                if self.prompts[-1] == "/compact":
+                    while not release_compact.is_set():
+                        await asyncio.sleep(0.01)
+                    yield SystemMessage()
+                yield ResultMessage()
+
+        loop = asyncio.new_event_loop()
+        runner = threading.Thread(target=loop.run_forever, daemon=True)
+        runner.start()
+        self.addCleanup(lambda: (loop.call_soon_threadsafe(loop.stop), runner.join(2), loop.close()))
+        bridge = _Bridge()
+        bridge._workspace, bridge._sdk = Path(self.workspace), object()
+        state = bridge._reservation_state("auto_review", "native-session", [])
+        state["client"], state["effort"] = Client(), "high"
+        bridge._reservations["reservation-a"] = state
+        compact_timeouts: list[float | None] = []
+
+        def request(op: str, payload: dict, *, timeout_seconds: float | None = None, read_only: bool = False) -> dict:
+            if op == "compact":
+                compact_timeouts.append(timeout_seconds)
+            future = asyncio.run_coroutine_threadsafe(bridge.dispatch(op, payload), loop)
+            try:
+                # The compact wait is cut short here the way the adapter's
+                # own deadline would end it: the bridge keeps compacting.
+                return dict(future.result(timeout=0.1 if op == "compact" else 5))
+            except concurrent.futures.TimeoutError:
+                raise ClaudeRuntimeError(f"Claude bridge timed out waiting for {op}") from None
+            except BridgeError as exc:
+                raise ClaudeRuntimeError(str(exc)) from None
+
+        adapter = ClaudeCodeAdapter(workspace=self.workspace)
+        adapter._threads["reservation-a"] = {
+            "generation": 0, "active_turn": None, "model": CLAUDE_WORKER_MODEL, "effort": "high",
+            "policy": {"posture": {"reviewer": "auto_review"}}, "provider_session": "native-session",
+        }
+        adapter._request = request
+        with patch("vnext.vnext_claude_bridge._write"):
+            with self.assertRaisesRegex(ClaudeRuntimeError, "timed out waiting for compact"):
+                adapter.compact("reservation-a")
+            self.assertGreaterEqual(compact_timeouts[0], 1800)
+            # The bridge still compacts: the next prompt waits.
+            self.assertFalse(adapter.can_start_turn("reservation-a"))
+            release_compact.set()
+            deadline = time.monotonic() + 2
+            while not adapter.can_start_turn("reservation-a") and time.monotonic() < deadline:
+                time.sleep(0.3)
+            self.assertTrue(adapter.can_start_turn("reservation-a"))
+            handle = adapter.start_turn("reservation-a", "after compact")
+        self.assertEqual("after compact", state["client"].prompts[-1])
+        self.assertEqual(1, state["generation"])
+        self.assertEqual(handle.turn_id, adapter._threads["reservation-a"]["active_turn"])
+
     def test_error_result_keeps_reader_through_taskupdated_terminal(self) -> None:
         """A provider error must not discard a later exact child terminal."""
 
@@ -2692,6 +2902,61 @@ class ClaudeBridgeTranscriptProjectionTests(unittest.TestCase):
         self.assertEqual(1, diagnostic["registration_permission_denied"])
         self.assertNotIn("reservation-a", json.dumps(diagnostic))
 
+    def test_system_messages_forward_only_allowlisted_fields(self) -> None:
+        class SystemMessage:
+            def __init__(self, subtype: str, data: dict) -> None:
+                self.subtype = subtype
+                self.data = data
+
+        class AssistantMessage:
+            session_id = "native-session"
+            content = []
+            model = "claude-test"
+            parent_tool_use_id = None
+            stop_reason = None
+
+        init = SystemMessage("init", {
+            "type": "system", "subtype": "init", "session_id": "native-session",
+            "cwd": "/private/workspace", "apiKeySource": "user", "model": "claude-test",
+            "tools": ["Bash", "Read"], "slash_commands": ["compact", "context"],
+            "mcp_servers": [{"name": "vnext", "status": "connected", "source": "https://host/?token=secret"}],
+            "permissionMode": "default", "output_style": "default", "agents": ["general-purpose"],
+            "skills": ["review"], "plugins": [{"name": "p", "path": "/private/plugin"}],
+            "mcp_server_errors": [{"url": "https://host/?token=secret"}],
+            "memory_paths": {"user": "/private/memory"}, "claude_code_version": "2.1.288", "uuid": "u-1",
+        })
+        compact = SystemMessage("compact_boundary", {
+            "type": "system", "subtype": "compact_boundary", "session_id": "native-session", "uuid": "u-2",
+            "compact_metadata": {"trigger": "manual", "pre_tokens": 1200, "user_context": "private words"},
+        })
+        hook = SystemMessage("hook_response", {"session_id": "native-session", "stdout": "token=secret"})
+        written: list[dict] = []
+        with patch("vnext.vnext_claude_bridge._write", side_effect=written.append):
+            # The init message arrives before the first assistant frame
+            # attests the native session, so it is held, then released.
+            self.bridge._emit_message("reservation-a", 1, init)
+            self.assertEqual([], [r for r in written if r["event"]["name"] == "system_message"])
+            self.bridge._emit_message("reservation-a", 1, AssistantMessage())
+            self.bridge._emit_message("reservation-a", 1, compact)
+            self.bridge._emit_message("reservation-a", 1, hook)
+        events = [r["event"] for r in written if r["event"]["name"] == "system_message"]
+        self.assertEqual(["init", "compact_boundary", "hook_response"], [e["subtype"] for e in events])
+        self.assertEqual({
+            "session_id": "native-session", "model": "claude-test", "tools": ["Bash", "Read"],
+            "slash_commands": ["compact", "context"],
+            "mcp_servers": [{"name": "vnext", "status": "connected"}],
+            "permissionMode": "default", "output_style": "default", "agents": ["general-purpose"],
+            "skills": ["review"], "claude_code_version": "2.1.288", "uuid": "u-1",
+        }, events[0]["data"])
+        self.assertEqual({
+            "session_id": "native-session", "uuid": "u-2",
+            "compact_metadata": {"trigger": "manual", "pre_tokens": 1200},
+        }, events[1]["data"])
+        self.assertEqual({"session_id": "native-session"}, events[2]["data"])
+        self.assertTrue(all(e["correlation_attested"] for e in events))
+        self.assertNotIn("secret", json.dumps(events))
+        self.assertNotIn("/private", json.dumps(events))
+
     def test_structured_provider_rate_limit_is_projected_and_fails_the_turn(self) -> None:
         class AssistantMessage:
             session_id = "native-session"
@@ -3060,7 +3325,7 @@ class ClaudeBridgeToolHostingTests(unittest.TestCase):
         )
         self.assertEqual("acceptEdits", recorder[-1]["permission_mode"])
         with self.assertRaisesRegex(BridgeError, "unsupported Claude permission mode"):
-            _requested_permission_mode("bypassPermissions")
+            _requested_permission_mode("dontAsk")
 
     def test_a_worker_with_no_tools_still_registers_the_post_tool_clock_hook(self) -> None:
         recorder: list = []

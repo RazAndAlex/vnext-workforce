@@ -9,6 +9,11 @@
       "name": "vnext",
       "source": "./plugins/vnext",
       "description": "Give Claude Code a vNext workforce: delegate bounded work to Codex and Claude workers, await their evidence, and judge it."
+    },
+    {
+      "name": "vnext-session-record",
+      "source": "./plugins/vnext-session-record",
+      "description": "Record the subagents, models and usage of every Claude Code session, and show them in the /vnext pane."
     }
   ]
 }

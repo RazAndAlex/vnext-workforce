@@ -122,7 +122,7 @@ class ClaudeTerminalTests(unittest.TestCase):
             with self.assertRaisesRegex(ClaudeTerminalError, "attested UUID"):
                 manager.acquire(**common)
             common["native_session_id"] = "6044886c-211e-4e8e-a660-10f3bf0ed1b5"
-            common["permission_mode"] = "bypassPermissions"
+            common["permission_mode"] = "dontAsk"
             with self.assertRaisesRegex(ClaudeTerminalError, "permission mode"):
                 manager.acquire(**common)
             common["permission_mode"] = "default"

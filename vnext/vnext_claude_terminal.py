@@ -254,7 +254,9 @@ class ClaudeTerminalLeaseManager:
         sources = tuple(_require_string(source, "setting source") for source in setting_sources)
         if not sources:
             raise ClaudeTerminalError("at least one Claude setting source is required")
-        if permission_mode not in {"default", "acceptEdits"}:
+        # The terminal is the user's own interactive CLI and holds no vNext
+        # approval policy, so bypassPermissions is the user's call here.
+        if permission_mode not in {"default", "acceptEdits", "plan", "auto", "bypassPermissions"}:
             raise ClaudeTerminalError("Claude terminal permission mode is unsupported")
         with self._lock:
             if runtime_thread_id in self._by_thread:

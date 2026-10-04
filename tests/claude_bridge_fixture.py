@@ -189,6 +189,36 @@ def main() -> int:
                     "cursor": event_cursor + 1,
                 }})
                 event_cursor += 1
+            if mode == "system-message":
+                # The bridge forwards the CLI's init system message with only
+                # its allowlisted fields, correlated like any held message.
+                assert isinstance(reservation_id, str)
+                assert isinstance(generation, int)
+                emit({"v": 1, "kind": "event", "event": {
+                    "name": "system",
+                    "reservation_id": reservation_id,
+                    "generation": generation,
+                    "cursor": event_cursor + 1,
+                    "native_identity": {"session_id": "fixture-native-session", "source": "AssistantMessage"},
+                }})
+                event_cursor += 1
+                emit({"v": 1, "kind": "event", "event": {
+                    "name": "system_message",
+                    "reservation_id": reservation_id,
+                    "turn_reference": turn_reference,
+                    "generation": generation,
+                    "subtype": "init",
+                    "data": {
+                        "session_id": "fixture-native-session",
+                        "model": "claude-fixture",
+                        "tools": ["Bash", "Read"],
+                        "slash_commands": ["compact", "context"],
+                    },
+                    "provider_correlation": {"session": "fixture-native-session", "turn": turn_reference},
+                    "correlation_attested": True,
+                    "cursor": event_cursor + 1,
+                }})
+                event_cursor += 1
             if mode == "manager-tools":
                 # Drive the bidirectional tool-call op the way the real bridge
                 # does: emit one correlated request, block on stdin for the
@@ -241,6 +271,15 @@ def main() -> int:
             respond(request_id, {"provider_echo": True, "status": "completed"})
         elif op == "interrupt":
             respond(request_id, {"provider_echo": True, "interrupted": True})
+        elif op == "compact":
+            payload = request["payload"]
+            respond(request_id, {
+                "reservation_echo": payload.get("reservation_id"),
+                "compacted": True,
+                "trigger": "manual",
+                "pre_tokens": 15919,
+                "post_tokens": 1999,
+            })
         elif op == "stop_native_task":
             payload = request["payload"]
             respond(request_id, {

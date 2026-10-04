@@ -28,11 +28,23 @@ the copy stays as it is while the plugin's version number stays the same. After
 a pull that changes the plugin, run `claude plugin uninstall vnext@vnext`
 and `claude plugin install vnext@vnext` to refresh it.
 
-`uv tool install` puts the `vnext-mcp` launcher in `~/.local/bin` on macOS and
-in `%USERPROFILE%\.local\bin` on Windows, and Claude Code reaches it through
-PATH. Run `uv tool update-shell` once, so your shell startup file holds that
-folder, then prove it with `vnext-mcp --help`. Until that command prints its
-usage in a fresh terminal, the plugin cannot start the server either.
+The plugin needs `uv` on PATH. Claude Code starts `plugins/vnext/launch.py`
+through `uv run`, and that small script finds vNext by itself. It tries these
+places in order:
+
+1. The `vnext-mcp` command in the `.venv` folder of the clone that holds the
+   plugin.
+2. A `vnext-mcp` command on PATH.
+3. The clone itself, through `uv run --extra claude`. The first start of this
+   kind builds the clone's `.venv`, and later starts use step 1.
+
+When it finds none of them, it writes one message to the server's error output
+and names the command that fixes it. Read that message with `claude --debug`.
+
+`uv tool install` is still the way to install vNext for use outside a clone. It
+puts the `vnext-mcp` launcher in `~/.local/bin` on macOS and in
+`%USERPROFILE%\.local\bin` on Windows. Run `uv tool update-shell` once, so your
+shell startup file holds that folder, then prove it with `vnext-mcp --help`.
 
 Then restart Claude Code the whole way: quit the application and open it again
 (Cmd-Q on macOS, and close every window on Windows). Opening one more window
@@ -52,7 +64,7 @@ Read it with `vnext-mcp --check`: it prints the models it would offer, or the
 error that stopped the start, and exits non-zero when the start would fail. Two
 causes cover almost every failure.
 
-- PATH does not reach `vnext-mcp`. Prove the command in a fresh terminal, then
+- PATH does not reach `uv`. Prove `uv --version` in a fresh terminal, then
   start Claude Code from that terminal, which hands it the PATH you just proved.
   "Running it by hand instead", below, needs no PATH at all.
 - No provider has a login or a key, so there is no worker model to offer. Run

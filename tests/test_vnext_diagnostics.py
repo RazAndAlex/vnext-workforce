@@ -439,7 +439,7 @@ class SourceCoverageTests(unittest.TestCase):
     # UPDATE THESE NUMBERS DELIBERATELY when you add or remove a raise site.
     # Having to edit the number is the point: it is the moment you confirm the
     # new literal is classified rather than merely tolerated.
-    EXPECTED_LITERALS = {"vnext_claude.py": 120, "vnext_claude_bridge.py": 132}
+    EXPECTED_LITERALS = {"vnext_claude.py": 121, "vnext_claude_bridge.py": 139}
 
     # Raise sites whose message genuinely cannot be read from the source, each
     # with the reason it is acceptable.  Keyed by (module, raiser, expression)

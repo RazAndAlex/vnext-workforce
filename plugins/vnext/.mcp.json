@@ -1,8 +1,12 @@
 {
   "mcpServers": {
     "vnext": {
-      "command": "vnext-mcp",
+      "command": "uv",
       "args": [
+        "run",
+        "--no-project",
+        "--quiet",
+        "${CLAUDE_PLUGIN_ROOT}/launch.py",
         "--plugin-root",
         "${CLAUDE_PLUGIN_ROOT}",
         "--",

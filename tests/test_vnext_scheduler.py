@@ -2203,6 +2203,197 @@ class VNextSchedulerTests(unittest.TestCase):
         self.assertIn("reached its 30m 00s limit", child.blocker)
         self.assertIn("retry continues the same session", child.blocker)
 
+    _HOOK_SENTENCE = (
+        "PreToolUse hook did not respond before its timeout (host client may be unreachable)"
+    )
+
+    def _finish_turn_with_result(self, scheduler, child, result, number):
+        self.control.start_turn(child.agent_id, thread_id="thread-h")
+        scheduler._handle_turn_finished(_TurnFinished(
+            child.agent_id,
+            types.SimpleNamespace(
+                agent_id=child.agent_id, provider="claude", phase="work",
+                control_turn_id=f"control-turn-{number}",
+                runtime=types.SimpleNamespace(thread_id="thread-h", turn_id=f"native-{number}"),
+            ),
+            result=result,
+        ))
+
+    def test_a_turn_that_ends_on_hook_failures_blocks_and_wakes_the_parent(self) -> None:
+        """Gap 2 of the 3-4 October stall.
+
+        The worker's last tool calls all failed because its hooks got no
+        answer.  The turn still ended normally, so the worker went READY
+        waiting for mail and its manager was never told.
+        """
+
+        scheduler, record, child = self._resumable_root_with_one_worker()
+        scheduler.hooks = SchedulerHooks(lifecycle=lambda *args: None)
+        session = self.control.sessions[self.root.session_id]
+        # A turn whose tool calls ran is the ordinary end: nobody is woken.
+        self._finish_turn_with_result(scheduler, child, {"status": "completed"}, 1)
+        self.assertEqual(AgentStatus.READY, child.status)
+        self.assertEqual([], session.wakes.get(record.agent_id, []))
+
+        self._finish_turn_with_result(scheduler, child, {
+            "status": "completed",
+            "hook_failures": {"count": 4, "first": self._HOOK_SENTENCE},
+        }, 2)
+
+        self.assertEqual(AgentStatus.BLOCKED, child.status)
+        self.assertEqual(
+            f"4 tool calls failed in its last turn: {self._HOOK_SENTENCE}", child.blocker,
+        )
+        self.assertEqual(
+            ["child-blocked"], [wake["reason"] for wake in session.wakes[record.agent_id]],
+        )
+
+    def test_an_unsolicited_turn_that_ends_on_hook_failures_blocks_a_resting_worker(self) -> None:
+        """The provider's own turn between vNext turns goes through the same check."""
+
+        scheduler, record, child = self._resumable_root_with_one_worker()
+        scheduler.hooks = SchedulerHooks(lifecycle=lambda *args: None)
+        session = self.control.sessions[self.root.session_id]
+        self._finish_turn_with_result(scheduler, child, {"status": "completed"}, 1)
+        self.assertEqual(AgentStatus.READY, child.status)
+
+        failures = {"count": 2, "first": self._HOOK_SENTENCE}
+        # A turn that ran its tools, or one that did not complete, is no news.
+        scheduler.observe_unsolicited_turn(child.agent_id, {"status": "completed"})
+        scheduler.observe_unsolicited_turn(child.agent_id, {"status": "stream-ended", "hook_failures": failures})
+        self.assertTrue(scheduler._events.empty())
+        # While a vNext turn runs, that turn's own end decides.
+        self.control.start_turn(child.agent_id, thread_id="thread-h")
+        scheduler._active_turns[child.agent_id] = object()
+        scheduler.observe_unsolicited_turn(child.agent_id, {"status": "completed", "hook_failures": failures})
+        scheduler._handle_unsolicited_turn_ended(scheduler._events.get_nowait())
+        self.assertEqual(AgentStatus.RUNNING, child.status)
+        scheduler._active_turns.pop(child.agent_id)
+        self.control.finish_turn(child.agent_id)
+
+        scheduler.observe_unsolicited_turn(child.agent_id, {"status": "completed", "hook_failures": failures})
+        scheduler._handle_unsolicited_turn_ended(scheduler._events.get_nowait())
+
+        self.assertEqual(AgentStatus.BLOCKED, child.status)
+        self.assertEqual(f"2 tool calls failed in its last turn: {self._HOOK_SENTENCE}", child.blocker)
+        self.assertEqual(
+            ["child-blocked"], [wake["reason"] for wake in session.wakes[record.agent_id]],
+        )
+
+    def test_unsolicited_hook_failures_survive_a_vnext_turn_that_started_first(self) -> None:
+        """The failure is queued, then a vNext turn starts before it is read.
+
+        Before the fix the handler dropped it, saying the new turn's end would
+        check; but that turn reports only its own tool results, so a plain
+        status reply ended the worker READY and nobody was woken.
+        """
+
+        scheduler, record, child = self._resumable_root_with_one_worker()
+        scheduler.hooks = SchedulerHooks(lifecycle=lambda *args: None)
+        session = self.control.sessions[self.root.session_id]
+        self._finish_turn_with_result(scheduler, child, {"status": "completed"}, 1)
+        failures = {"count": 2, "first": self._HOOK_SENTENCE}
+        scheduler.observe_unsolicited_turn(child.agent_id, {"status": "completed", "hook_failures": failures})
+        # A new vNext turn starts before the loop reads the event.
+        self.control.start_turn(child.agent_id, thread_id="thread-h")
+        scheduler._active_turns[child.agent_id] = object()
+        scheduler._handle_unsolicited_turn_ended(scheduler._events.get_nowait())
+        self.assertEqual(AgentStatus.RUNNING, child.status)
+        self.control.finish_turn(child.agent_id)
+
+        # That turn ends on a status reply with no failures of its own.
+        self._finish_turn_with_result(scheduler, child, {"status": "completed"}, 2)
+
+        self.assertEqual(AgentStatus.BLOCKED, child.status)
+        self.assertEqual(f"2 tool calls failed in its last turn: {self._HOOK_SENTENCE}", child.blocker)
+        self.assertEqual(
+            ["child-blocked"], [wake["reason"] for wake in session.wakes[record.agent_id]],
+        )
+
+    def _defer_hook_failures_behind_a_vnext_turn(self, scheduler, child):
+        failures = {"count": 2, "first": self._HOOK_SENTENCE}
+        scheduler.observe_unsolicited_turn(child.agent_id, {"status": "completed", "hook_failures": failures})
+        self.control.start_turn(child.agent_id, thread_id="thread-h")
+        scheduler._active_turns[child.agent_id] = object()
+        scheduler._handle_unsolicited_turn_ended(scheduler._events.get_nowait())
+        self.assertEqual(AgentStatus.RUNNING, child.status)
+        self.control.finish_turn(child.agent_id)
+
+    def test_deferred_hook_failures_survive_an_interrupted_vnext_turn(self) -> None:
+        """The vNext turn the failure waited for is interrupted on purpose.
+
+        Before the fix the interrupt branch returned before the deferred
+        blocker was applied, so the worker went READY and its parent was
+        never told.
+        """
+
+        scheduler, record, child = self._resumable_root_with_one_worker()
+        scheduler.hooks = SchedulerHooks(lifecycle=lambda *args: None)
+        session = self.control.sessions[self.root.session_id]
+        self._finish_turn_with_result(scheduler, child, {"status": "completed"}, 1)
+        self._defer_hook_failures_behind_a_vnext_turn(scheduler, child)
+
+        scheduler._interrupted_agents.add(child.agent_id)
+        self._finish_turn_with_result(scheduler, child, {
+            "status": "interrupted", "terminal_reason": "interrupted_before_dispatch",
+        }, 2)
+
+        self.assertEqual(AgentStatus.BLOCKED, child.status)
+        self.assertEqual(f"2 tool calls failed in its last turn: {self._HOOK_SENTENCE}", child.blocker)
+        self.assertEqual(
+            ["child-blocked"], [wake["reason"] for wake in session.wakes[record.agent_id]],
+        )
+
+    def test_a_deferred_blocker_applied_on_interrupt_is_not_applied_again(self) -> None:
+        """Once spent, the failure does not block the worker's next turn too."""
+
+        scheduler, record, child = self._resumable_root_with_one_worker()
+        scheduler.hooks = SchedulerHooks(lifecycle=lambda *args: None)
+        session = self.control.sessions[self.root.session_id]
+        self._finish_turn_with_result(scheduler, child, {"status": "completed"}, 1)
+        self._defer_hook_failures_behind_a_vnext_turn(scheduler, child)
+        scheduler._interrupted_agents.add(child.agent_id)
+        self._finish_turn_with_result(scheduler, child, {"status": "interrupted"}, 2)
+        self.assertEqual(AgentStatus.BLOCKED, child.status)
+        self.assertNotIn(child.agent_id, scheduler._deferred_blockers)
+
+        # The manager retries the worker and its next turn ends normally.
+        scheduler._interrupted_agents.discard(child.agent_id)
+        self.control.retry_agent(
+            requester_id=record.agent_id, agent_id=child.agent_id,
+            revised_task_contract={"objective": "carry on"},
+        )
+        self._finish_turn_with_result(scheduler, child, {"status": "completed"}, 3)
+
+        self.assertEqual(AgentStatus.READY, child.status)
+        self.assertEqual(
+            ["child-blocked"], [wake["reason"] for wake in session.wakes[record.agent_id]],
+        )
+
+    def test_a_provider_stream_that_ends_between_turns_blocks_a_resting_worker(self) -> None:
+        """The bridge can no longer read the worker's session: say so to the parent."""
+
+        scheduler, record, child = self._resumable_root_with_one_worker()
+        scheduler.hooks = SchedulerHooks(lifecycle=lambda *args: None)
+        session = self.control.sessions[self.root.session_id]
+        self._finish_turn_with_result(scheduler, child, {"status": "completed"}, 1)
+        self.assertEqual(AgentStatus.READY, child.status)
+
+        scheduler.observe_unsolicited_turn(child.agent_id, {"status": "frame-dropped", "error": "MessageParseError"})
+        self.assertTrue(scheduler._events.empty())
+        scheduler.observe_unsolicited_turn(child.agent_id, {"status": "reader-ended", "error": "CLIConnectionError"})
+        scheduler._handle_unsolicited_turn_ended(scheduler._events.get_nowait())
+
+        self.assertEqual(AgentStatus.BLOCKED, child.status)
+        self.assertEqual(
+            "the Claude session's message stream stopped between turns (CLIConnectionError); "
+            "nothing answers its hooks or approvals any more",
+            child.blocker,
+        )
+        self.assertEqual(
+            ["child-blocked"], [wake["reason"] for wake in session.wakes[record.agent_id]],
+        )
+
     def test_an_idle_timeout_inside_the_limit_carries_no_limit_hint(self) -> None:
         scheduler, child = self._finish_with(
             RuntimeError("app-server event wait timed out after 600s without activity"),
@@ -5474,6 +5665,42 @@ class VNextSchedulerTests(unittest.TestCase):
         scheduler.release_native_control_lease(self.root.agent_id)
         self.assertIsNone(scheduler._native_message_delivery(self.root.agent_id))
 
+    def test_compact_agent_holds_the_lease_while_the_adapter_compacts(self) -> None:
+        scheduler = self._scheduler()
+        calls = []
+
+        def compact(thread_id: str, *, timeout_seconds: float) -> dict:
+            calls.append((thread_id, self.root.agent_id in scheduler._native_control_leases))
+            self.assertEqual(scheduler.turn_timeout, timeout_seconds)
+            return {"compacted": True, "pre_tokens": 10, "post_tokens": 2}
+
+        self.managed._adapter_for(self.root.agent_id).compact = compact
+        result = scheduler.compact_agent(self.root.agent_id)
+        self.assertEqual({"compacted": True, "pre_tokens": 10, "post_tokens": 2, "agent_id": self.root.agent_id}, result)
+        self.assertEqual([(self.managed._threads[self.root.agent_id], True)], calls)
+        self.assertNotIn(self.root.agent_id, scheduler._native_control_leases)
+
+    def test_rejected_compact_keeps_a_native_control_lease_it_did_not_acquire(self) -> None:
+        # A native terminal already owns the primary.  The adapter refuses to
+        # compact under terminal ownership, and that refusal must not drop the
+        # terminal's lease, or its next native turn has no lease to run under.
+        scheduler = self._scheduler()
+        scheduler._watch_turn = lambda _turn: None
+        scheduler.acquire_native_control_lease(self.root.agent_id)
+
+        def compact(_thread_id: str, **_kwargs: object) -> dict:
+            raise ClaudeRuntimeError("Claude thread is owned by a native terminal")
+
+        self.managed._adapter_for(self.root.agent_id).compact = compact
+        with self.assertRaisesRegex(ClaudeRuntimeError, "native terminal"):
+            scheduler.compact_agent(self.root.agent_id)
+
+        self.assertIn(self.root.agent_id, scheduler._native_control_leases)
+        thread = self.managed._threads[self.root.agent_id]
+        scheduler.adopt_native_turn(agent_id=self.root.agent_id, provider="fixture",
+                                    thread_id=thread, turn_id="terminal-after-compact", cursor=0)
+        self.assertIn(self.root.agent_id, scheduler._active_turns)
+
     def test_native_control_lease_prevents_a_competing_scheduler_turn(self) -> None:
         scheduler = self._scheduler()
         scheduler.acquire_native_control_lease(self.root.agent_id)
@@ -8630,7 +8857,7 @@ class VNextWorktreeWorkspaceTests(unittest.TestCase):
         scheduler = self._completing_scheduler()
 
         def rejected(agent):
-            raise RuntimeError("provider at /home/someone/private/key.json; api_key=PLAINSECRET123")
+            raise RuntimeError("provider at /home/someone/private/key.json; api_key=PLAINSECRET123")  # gitleaks:allow (fake key: tests redaction)
 
         self.managed.adapter_for_agent = rejected
         self.assertFalse(scheduler._bind_agent(worker))

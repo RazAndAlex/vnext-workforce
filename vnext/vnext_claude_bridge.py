@@ -11,8 +11,10 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -41,6 +43,10 @@ def _expected_sdk_version() -> str:
     return os.environ.get(_SDK_VERSION_ENV) or CLAUDE_SDK_VERSION
 _VERSION = 1
 _MAX_JSONL = 65_536
+# Opted-in tool arguments above this size travel as a preview, so one event
+# stays well inside _MAX_JSONL after escaping and the event envelope.
+_TOOL_INPUT_MAX_CHARS = 32_000
+_TOOL_INPUT_PREVIEW_CHARS = 8_000
 _MAX_PENDING_EFFECTS = 64
 _MAX_METADATA_REFRESH_PER_EVENT = 4
 # The resolver keeps at most this many unresolved children, so one settling
@@ -56,6 +62,18 @@ _EFFECT_TYPES = {"Bash": "command", "Write": "file"}
 _TOOL_SERVER_KEY = "vnext"
 _TOOL_NAMESPACE = f"mcp__{_TOOL_SERVER_KEY}__"
 _TOOL_CALL_TIMEOUT_SECONDS = 300.0
+# What a CLI system message may carry out of the bridge, by subtype.  Read
+# from the init and compact_boundary writers in Claude Code 2.1.288.  Any
+# other subtype forwards its session id alone, since hook and command output
+# can hold anything.
+_SYSTEM_MESSAGE_FIELDS: dict[str, tuple[str, ...]] = {
+    "init": (
+        "session_id", "model", "tools", "slash_commands", "terminal_slash_commands",
+        "mcp_servers", "permissionMode", "output_style", "agents", "skills",
+        "claude_code_version", "uuid",
+    ),
+    "compact_boundary": ("session_id", "uuid", "compact_metadata"),
+}
 # The user's own settings load in every worker, and with them the vNext plugin
 # this repository ships.  Each worker then started a second, independent vNext
 # server of its own beside the bridge's tools: 13 extra proxy and server pairs
@@ -175,7 +193,15 @@ def _requested_effort(value: object) -> str:
 
 
 def _requested_permission_mode(value: object) -> str:
-    if value not in {"default", "acceptEdits"}:
+    if value in {"bypassPermissions", "auto"}:
+        # The CLI approves calls in these modes before it consults
+        # can_use_tool (auto through its own permission evaluator), and
+        # relay_permission is where vNext asks the reviewer, refuses untracked
+        # native children and records effects.  The posture this bridge
+        # attests (approvals requested, network approval-gated) would then be
+        # false, so the binding fails instead.
+        raise BridgeError(f"unsupported Claude permission mode: {value} skips can_use_tool, which carries vNext approvals")
+    if value not in {"default", "acceptEdits", "plan"}:
         raise BridgeError("thread request has unsupported Claude permission mode")
     return str(value)
 
@@ -406,6 +432,48 @@ class BridgeError(RuntimeError):
     pass
 
 
+class _StreamEnd:
+    """Queued by the pump when the client's message stream ends."""
+
+    def __init__(self, error: Exception | None) -> None:
+        self.error = error
+
+
+# The whole tool result the CLI writes in place of a call it did not run
+# because a PreToolUse hook did not answer or failed.  CLI 2.1.286 has two:
+# "PreToolUse hook did not respond before its timeout (host client may be
+# unreachable). The tool call was not executed; other configured hooks may not
+# have completed." and the same with "failed with an unexpected error".  It
+# must be the entire result: a command that ran can print the sentence, and
+# a pytest run asserting on it did block a worker.
+_HOOK_FAILURE = re.compile(
+    r"PreToolUse hook [^\n]{1,160}\. The tool call was not executed; "
+    r"other configured hooks may not have completed\."
+)
+_HOOK_FAILURE_TEXT = 300
+# Seconds the CLI waits for one of this bridge's hooks before it gives up.
+_HOOK_TIMEOUT_SECONDS = 30
+
+
+def _hook_failure_line(block: Any) -> str | None:
+    """The hook-failure sentence of a failed tool result, or None."""
+
+    if getattr(block, "is_error", None) is not True:
+        return None
+    content = getattr(block, "content", None)
+    if isinstance(content, list):
+        content = "\n".join(
+            str(item.get("text") or "") for item in content
+            if isinstance(item, Mapping) and item.get("type") == "text"
+        )
+    if not isinstance(content, str):
+        return None
+    content = content.strip()
+    if _HOOK_FAILURE.fullmatch(content) is None:
+        return None
+    return content[:_HOOK_FAILURE_TEXT]
+
+
 def _write(record: Mapping[str, Any]) -> None:
     encoded = json.dumps(record, separators=(",", ":"), ensure_ascii=True)
     if len(encoded) > _MAX_JSONL:
@@ -436,6 +504,24 @@ def _request(raw: str) -> tuple[int, str, Mapping[str, Any]]:
     if not isinstance(request_id, int) or request_id < 1 or not isinstance(op, str) or not isinstance(payload, Mapping):
         raise BridgeError("incoming request fields are invalid")
     return request_id, op, payload
+
+
+_REPLAY_FLAG = "replay-user-messages"
+
+
+def _replays_prompts(client: Any) -> bool:
+    extra = getattr(getattr(client, "options", None), "extra_args", None)
+    return isinstance(extra, Mapping) and _REPLAY_FLAG in extra
+
+
+async def _echoed_prompt(prompt: str, echo: str):  # type: ignore[no-untyped-def]
+    # The string form of ``query`` cannot carry a uuid; a stream message can.
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+        "parent_tool_use_id": None,
+        "uuid": echo,
+    }
 
 
 class _Bridge:
@@ -525,7 +611,8 @@ class _Bridge:
         ):
             return
         state = self._reservations.get(reservation_id)
-        if state is None or state.get("turn_reference") != turn_reference:
+        routed = state.get("permission_turns", {}).get(tool_use_id) if state is not None else None
+        if state is None or (routed or state.get("turn_reference")) != turn_reference:
             return
         pending = state.get("pending_permissions")
         future = pending.get(tool_use_id) if isinstance(pending, dict) else None
@@ -630,7 +717,9 @@ class _Bridge:
             reservation_id = payload.get("reservation_id")
             if not isinstance(reservation_id, str) or not reservation_id or reservation_id in self._reservations:
                 raise BridgeError("thread request lacks a fresh local reservation")
-            self._reservations[reservation_id] = self._reservation_state(reviewer, None, definitions, reservation_id=reservation_id)
+            self._reservations[reservation_id] = self._reservation_state(
+                reviewer, None, definitions, reservation_id=reservation_id, tool_inputs=payload.get("tool_inputs") is True
+            )
             self._reservations[reservation_id]["effort"] = effort
             self._reservations[reservation_id]["permission_mode"] = permission_mode
             self._reservations[reservation_id]["workspace"] = thread_workspace
@@ -691,6 +780,8 @@ class _Bridge:
             return await self._wait_turn(payload)
         if op == "interrupt":
             return await self._interrupt(payload)
+        if op == "compact":
+            return await self._compact(payload)
         if op == "release_for_terminal":
             return await self._release_for_terminal(payload)
         if op == "release_agent":
@@ -743,15 +834,32 @@ class _Bridge:
 
     def _reservation_state(
         self, reviewer: str, session_id: str | None, definitions: Sequence[Mapping[str, Any]],
-        *, reservation_id: str | None = None,
+        *, reservation_id: str | None = None, tool_inputs: bool = False,
     ) -> dict[str, Any]:
         state = {
             "generation": 0,
+            # Session opt-in (claude_tool_inputs) for the host: copy tool_use
+            # arguments into message events.  Off by default; see
+            # _project_content for why.
+            "tool_inputs": tool_inputs is True,
             "session_id": session_id,
-            # This is the sole owner of ``client.receive_messages()`` for the
-            # reservation.  It may remain active after a primary ResultMessage
-            # while exact native child lifecycle frames are still in flight.
+            # The turn's reader.  It owns this reservation's turn and may
+            # remain active after a primary ResultMessage while exact native
+            # child lifecycle frames are still in flight.  It reads frames
+            # from ``consumer``, which the pump fills.
             "task": None,
+            # The sole owner of ``client.receive_messages()`` for the life of
+            # the connected client.  The CLI starts turns of its own between
+            # vNext turns (a background task that finished queues a
+            # task-notification), and the SDK stops reading stdout, hook
+            # callbacks included, once 100 of those frames sit unread.  So the
+            # stream is read from the first turn until disconnect, and a frame
+            # with no turn to take it is recorded as an unsolicited turn.
+            "pump": None,
+            "stream": None,
+            "consumer": None,
+            "unsolicited": None,
+            "unsolicited_serial": 0,
             "client": None,
             "release_requested": False,
             "release_task": None,
@@ -1073,6 +1181,9 @@ class _Bridge:
             result["status"] = "failed"
         else:
             result["status"] = "completed"
+        hook_failures = self._hook_failure_summary(state)
+        if hook_failures is not None:
+            result["hook_failures"] = hook_failures
         outcome["result"] = result
         completion = outcome.get("completion")
         if isinstance(completion, asyncio.Future) and not completion.done():
@@ -1113,8 +1224,10 @@ class _Bridge:
         if payload.get("effort", state.get("effort")) != state.get("effort"):
             raise BridgeError("turn effort drifted from the connected Claude session")
         state["generation"] = generation
+        state["prior_turn_reference"] = state.get("turn_reference")
         state["turn_reference"] = turn_reference
         state["turn_started_monotonic"] = time.monotonic()
+        state["hook_failures"] = []
         budget = payload.get("turn_timeout")
         state["turn_timeout"] = float(budget) if isinstance(budget, (int, float)) else None
         state["last_message_monotonic"] = None
@@ -1129,6 +1242,8 @@ class _Bridge:
             "turn_reference": turn_reference,
             "interrupt_requested": False,
             "completion": completion,
+            # Set by an interrupt that lands before the prompt is sent.
+            "interrupted": asyncio.Event(),
         }
         reader = asyncio.create_task(self._run_query(reservation_id, generation, prompt))
         # The completion Future carries a reader failure to the exact primary
@@ -1239,7 +1354,74 @@ class _Bridge:
             if not isinstance(outcome.get("terminal"), Mapping):
                 outcome["interrupt_requested"] = False
             raise
+        interrupted = outcome.get("interrupted")
+        if isinstance(interrupted, asyncio.Event):
+            # A turn still waiting for the CLI's own turn to end has sent
+            # nothing; this ends it there.  The interrupt above stopped the
+            # CLI's own turn, which is the work running now.
+            interrupted.set()
         return {"reservation_echo": reservation_id, "interrupted": True}
+
+    async def _compact(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Compact an idle reservation's session by sending ``/compact``.
+
+        claude-agent-sdk has no compact method.  The CLI runs the slash command
+        when it arrives as a streaming prompt and answers with a
+        ``compact_boundary`` SystemMessage (a live probe showed this; covered by
+        ``test_compact_emits_the_boundary_and_the_result_usage_as_events``).  Only aggregate token counts are returned.
+        """
+
+        reservation_id = payload.get("reservation_id")
+        state = self._reservations.get(reservation_id) if isinstance(reservation_id, str) else None
+        if state is None:
+            raise BridgeError("compact request lacks a local reservation")
+        client = state.get("client")
+        if (
+            client is None
+            or state.get("task") is not None
+            or state.get("terminal_owner") is True
+            or state.get("release_requested") is True
+            # A turn the CLI started by itself is not idle, and its result
+            # would end this read before /compact answers.
+            or state.get("unsolicited") is not None
+        ):
+            raise BridgeError("compact requires an idle connected Claude reservation")
+        # Hold the sole-reader slot so start_turn and can_start_turn see a busy
+        # reservation while this request reads the client's message stream.
+        state["task"] = asyncio.current_task()
+        metadata: Mapping[str, Any] | None = None
+        queue = self._open_consumer(state)
+        try:
+            await client.query("/compact")
+            while True:
+                try:
+                    message = await self._next_frame(state, queue)
+                except StopAsyncIteration:
+                    break
+                source = type(message).__name__
+                if source == "SystemMessage" and getattr(message, "subtype", None) == "compact_boundary":
+                    data = getattr(message, "data", None)
+                    value = data.get("compact_metadata") if isinstance(data, Mapping) else None
+                    metadata = value if isinstance(value, Mapping) else {}
+                if source in {"SystemMessage", "ResultMessage"}:
+                    # The same path a turn uses, so the host gets the boundary as
+                    # provider.system and the result's usage update.  The
+                    # previous turn already holds its terminal, so this result
+                    # never completes a primary waiter.
+                    self._emit_message(reservation_id, state["generation"], message)
+                if source == "ResultMessage":
+                    break
+        finally:
+            self._release_consumer(reservation_id, state, queue)
+            state["task"] = None
+        if metadata is None:
+            raise BridgeError("Claude did not report a compact boundary")
+        answer: dict[str, Any] = {"reservation_echo": reservation_id, "compacted": True}
+        for key in ("trigger", "pre_tokens", "post_tokens"):
+            value = metadata.get(key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                answer[key] = value
+        return answer
 
     async def _release_for_terminal(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         """Disconnect an *idle* SDK client before the CLI resumes its session.
@@ -1263,9 +1445,12 @@ class _Bridge:
             raise BridgeError("cannot release Claude session while an SDK turn is active")
         if state.get("pending_permissions") or state.get("pending_tool_calls"):
             raise BridgeError("cannot release Claude session with pending control callbacks")
+        if state.get("unsolicited") is not None:
+            raise BridgeError("cannot release Claude session while an SDK turn is active")
         client = state.get("client")
         if client is None:
             raise BridgeError("Claude terminal release lacks a connected SDK client")
+        await self._stop_pump(state)
         await client.disconnect()
         state["client"] = None
         state["terminal_owner"] = True
@@ -1326,6 +1511,7 @@ class _Bridge:
                     completion = outcome.get("completion") if isinstance(outcome, Mapping) else None
                     if isinstance(completion, asyncio.Future) and not completion.done():
                         completion.cancel()
+        await self._stop_pump(state)
         client = state.get("client")
         if client is not None:
             release_task = state.get("release_task")
@@ -1389,7 +1575,9 @@ class _Bridge:
         if previous is not None and previous.get("client") is not None:
             raise BridgeError("Claude resume requires the prior SDK client to be released")
         resume_workspace = self._reservation_workspace(payload.get("workspace"))
-        self._reservations[reservation_id] = self._reservation_state(reviewer, session_id, definitions, reservation_id=reservation_id)
+        self._reservations[reservation_id] = self._reservation_state(
+            reviewer, session_id, definitions, reservation_id=reservation_id, tool_inputs=payload.get("tool_inputs") is True
+        )
         self._reservations[reservation_id]["effort"] = effort
         self._reservations[reservation_id]["permission_mode"] = permission_mode
         self._reservations[reservation_id]["workspace"] = resume_workspace
@@ -1466,6 +1654,287 @@ class _Bridge:
             identity["model_exact_history"] = list(history)
         return identity
 
+    def _stream(self, state: dict[str, Any]) -> Any:
+        stream = state.get("stream")
+        if stream is None:
+            client = state.get("client")
+            if client is None:
+                raise BridgeError("Claude reservation lacks a connected client")
+            stream = state["stream"] = client.receive_messages().__aiter__()
+        return stream
+
+    @staticmethod
+    def _pump_alive(state: Mapping[str, Any]) -> bool:
+        pump = state.get("pump")
+        return isinstance(pump, asyncio.Task) and not pump.done()
+
+    def _open_consumer(self, state: dict[str, Any]) -> asyncio.Queue[Any] | None:
+        """Take the frames for one turn: from the pump, or straight off the stream.
+
+        A turn reads the stream itself while no pump is reading it, which is
+        the first turn of a connected client.  The pump starts on the same
+        stream when that turn stops reading.
+        """
+
+        if self._pump_alive(state):
+            queue: asyncio.Queue[Any] = asyncio.Queue()
+            state["consumer"] = queue
+            return queue
+        if state.get("pump") is not None:
+            # A pump that ended, or was cancelled before it ran, leaves no
+            # stream this turn can trust to be where the pump stopped.
+            state["pump"] = None
+            state["stream"] = None
+        self._stream(state)
+        return None
+
+    async def _next_frame(self, state: dict[str, Any], queue: asyncio.Queue[Any] | None) -> Any:
+        """Return the turn's next frame; raise StopAsyncIteration at stream end."""
+
+        if queue is None:
+            return await self._stream(state).__anext__()
+        message = await queue.get()
+        if isinstance(message, _StreamEnd):
+            error = message.error
+            if error is not None:
+                # The same sentence the turn reader writes for a stream that
+                # fails under it directly.
+                raise BridgeError(f"Claude query failed: {type(error).__name__}: {error}") from error
+            raise StopAsyncIteration
+        return message
+
+    def _ensure_pump(self, reservation_id: str, state: dict[str, Any]) -> None:
+        """Keep reading the stream after a turn stops, for the client's life."""
+
+        if self._pump_alive(state) or state.get("client") is None:
+            return
+        stream = self._stream(state)
+        task = asyncio.create_task(self._pump(reservation_id, state, stream))
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        state["pump"] = task
+
+    async def _pump(self, reservation_id: str, state: dict[str, Any], stream: Any) -> None:
+        error: Exception | None = None
+        cancelled = False
+        try:
+            while True:
+                try:
+                    async for message in stream:
+                        self._route_frame(reservation_id, state, message)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if type(exc).__name__ != "MessageParseError" or state.get("client") is None:
+                        error = exc
+                        break
+                    # One frame the SDK could not parse ends the client's
+                    # iterator, but not the SDK's read loop under it.  A
+                    # reader that stopped here would fill the SDK buffer and
+                    # stall the next hook, so it records the frame and reads
+                    # on from a fresh iterator.
+                    self._write_turn_event(state, {
+                        "name": "unsolicited_turn",
+                        "reservation_id": reservation_id,
+                        "generation": state.get("generation"),
+                        "after_turn_reference": state.get("turn_reference"),
+                        "status": "frame-dropped",
+                        "error": type(exc).__name__,
+                    })
+                    if state.get("stream") is stream:
+                        state["stream"] = None
+                    stream = self._stream(state)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            # An ended or cancelled stream cannot be read again; the next turn
+            # asks the client for a fresh one, as each turn did before.
+            if state.get("stream") is stream:
+                state["stream"] = None
+            consumer = state.get("consumer")
+            if isinstance(consumer, asyncio.Queue):
+                consumer.put_nowait(_StreamEnd(error))
+            self._end_unsolicited(reservation_id, state, status="stream-ended")
+            if not cancelled and state.get("release_requested") is not True:
+                # Nothing reads this session any more: no hook, approval or
+                # result of it will be answered.  A turn reading through the
+                # pump fails on its own; one at rest has only this event.
+                self._write_turn_event(state, {
+                    "name": "unsolicited_turn",
+                    "reservation_id": reservation_id,
+                    "generation": state.get("generation"),
+                    "after_turn_reference": state.get("turn_reference"),
+                    "status": "reader-ended",
+                    "error": type(error).__name__ if error is not None else None,
+                })
+
+    async def _stop_pump(self, state: dict[str, Any]) -> None:
+        pump = state.get("pump")
+        state["pump"] = None
+        if isinstance(pump, asyncio.Task) and not pump.done() and pump is not asyncio.current_task():
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+        state["stream"] = None
+
+    def _release_consumer(
+        self, reservation_id: str, state: dict[str, Any], queue: asyncio.Queue[Any] | None,
+    ) -> None:
+        """Hand frames the turn reader left unread back to the unsolicited path.
+
+        A turn stops reading at its own result, and the pump can have queued
+        the next turn's first frames by then.  Dropping them would lose the
+        start of a turn the CLI began by itself.
+        """
+
+        if queue is not None and state.get("consumer") is queue:
+            state["consumer"] = None
+        while queue is not None and not queue.empty():
+            message = queue.get_nowait()
+            if not isinstance(message, _StreamEnd):
+                self._route_frame(reservation_id, state, message)
+        if state.get("client") is not None and state.get("release_requested") is not True:
+            self._ensure_pump(reservation_id, state)
+
+    def _route_frame(self, reservation_id: str, state: dict[str, Any], message: Any) -> None:
+        consumer = state.get("consumer")
+        if isinstance(consumer, asyncio.Queue):
+            consumer.put_nowait(message)
+            return
+        self._record_unsolicited(reservation_id, state, message)
+
+    def _record_unsolicited(self, reservation_id: str, state: dict[str, Any], message: Any) -> None:
+        try:
+            self._emit_unsolicited(reservation_id, state, message)
+        except Exception as exc:
+            # The pump must outlive one frame it cannot project: a pump that
+            # stops is exactly the unread stream this reader exists to drain.
+            self._write_turn_event(state, {
+                "name": "unsolicited_turn",
+                "reservation_id": reservation_id,
+                "generation": state.get("generation"),
+                "after_turn_reference": state.get("turn_reference"),
+                "status": "frame-dropped",
+                "error": type(exc).__name__,
+            })
+
+    def _emit_unsolicited(self, reservation_id: str, state: dict[str, Any], message: Any) -> None:
+        """Record a frame that arrived while no vNext turn was reading.
+
+        The turn opens at the first main-thread model output, because every
+        model turn ends in a ResultMessage; a stray system frame between turns
+        is recorded without opening one.
+        """
+
+        source = type(message).__name__
+        turn = state.get("unsolicited")
+        if (
+            turn is None
+            and source in {"AssistantMessage", "StreamEvent"}
+            and getattr(message, "parent_tool_use_id", None) is None
+        ):
+            serial = _counter_value(state.get("unsolicited_serial")) + 1
+            state["unsolicited_serial"] = serial
+            turn = state["unsolicited"] = {
+                "serial": serial, "frames": 0, "closed": asyncio.Event(),
+                "after_turn_reference": state.get("turn_reference"),
+            }
+            self._write_turn_event(state, {
+                "name": "unsolicited_turn",
+                "reservation_id": reservation_id,
+                "generation": state.get("generation"),
+                "after_turn_reference": turn["after_turn_reference"],
+                "unsolicited_serial": serial,
+                "status": "started",
+            })
+        if not isinstance(turn, dict):
+            self._emit_message(reservation_id, state["generation"], message, unsolicited=True)
+            return
+        turn["frames"] += 1
+        # start_turn can open the next vNext turn while this one runs, and
+        # _emit_message stamps events with the current reference.  The frames
+        # belong to the turn this one followed, so stamp them with that.
+        current = state.get("turn_reference")
+        state["turn_reference"] = turn["after_turn_reference"]
+        try:
+            self._emit_message(reservation_id, state["generation"], message, unsolicited=True)
+        finally:
+            state["turn_reference"] = current
+        if source == "ResultMessage":
+            self._end_unsolicited(
+                reservation_id, state, status="completed", is_error=getattr(message, "is_error", None) is True,
+            )
+
+    @staticmethod
+    async def _await_unsolicited_close(state: dict[str, Any], interrupted: asyncio.Event | None = None) -> None:
+        """Let a turn the CLI started by itself end before a vNext turn reads.
+
+        Its ResultMessage carries no prompt correlation.  A vNext turn that
+        registered while it was open would take that old result as its own,
+        which is how a resumed worker's turn closed on a stale result.  The
+        CLI queues a new prompt behind its running turn anyway, so waiting
+        here delays nothing the CLI would have answered sooner.  Nothing
+        awaits between the return and the caller registering its reader.
+        An interrupt of the waiting turn ends the wait too.
+        """
+
+        while interrupted is None or not interrupted.is_set():
+            turn = state.get("unsolicited")
+            closed = turn.get("closed") if isinstance(turn, dict) else None
+            if not isinstance(closed, asyncio.Event):
+                return
+            if interrupted is None:
+                await closed.wait()
+                continue
+            waits = [asyncio.ensure_future(closed.wait()), asyncio.ensure_future(interrupted.wait())]
+            try:
+                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for wait in waits:
+                    wait.cancel()
+
+    def _end_undispatched_turn(
+        self, state: dict[str, Any], generation: int, reason: str = "interrupted_before_dispatch",
+    ) -> None:
+        """Settle a turn interrupted before the CLI started its prompt."""
+
+        outcome = self._turn_outcome(state, generation)
+        if outcome is None or isinstance(outcome.get("terminal"), Mapping):
+            return
+        terminal = self._terminal_projection(None)
+        terminal["terminal_reason"] = reason
+        outcome["terminal"] = terminal
+        result = {**terminal, "status": "interrupted"}
+        outcome["result"] = result
+        completion = outcome.get("completion")
+        if isinstance(completion, asyncio.Future) and not completion.done():
+            completion.set_result(dict(result))
+
+    def _end_unsolicited(
+        self, reservation_id: str, state: dict[str, Any], *, status: str, is_error: bool = False,
+    ) -> None:
+        turn = state.get("unsolicited")
+        if not isinstance(turn, dict):
+            return
+        state["unsolicited"] = None
+        event: dict[str, Any] = {
+            "name": "unsolicited_turn",
+            "reservation_id": reservation_id,
+            "generation": state.get("generation"),
+            "after_turn_reference": turn.get("after_turn_reference"),
+            "unsolicited_serial": turn.get("serial"),
+            "status": status,
+            "frames": turn.get("frames"),
+            "is_error": is_error,
+        }
+        hook_failures = self._hook_failure_summary(turn)
+        if hook_failures is not None:
+            event["hook_failures"] = hook_failures
+        self._write_turn_event(state, event)
+        closed = turn.get("closed")
+        if isinstance(closed, asyncio.Event):
+            closed.set()
+
     async def _run_query(self, reservation_id: str, generation: int, prompt: str) -> None:
         if self._sdk is None or self._workspace is None:
             raise BridgeError("Claude bridge was not initialized")
@@ -1474,15 +1943,88 @@ class _Bridge:
         if client is None:
             raise BridgeError("Claude reservation lacks a connected client")
         counters_written = False
+        queue: asyncio.Queue[Any] | None = None
+        reading = False
+        outcome = self._turn_outcome(state, generation)
+        interrupted = outcome.get("interrupted") if outcome is not None else None
+        waited = isinstance(state.get("unsolicited"), dict)
         try:
-            await client.query(prompt)
+            await self._await_unsolicited_close(
+                state, interrupted if isinstance(interrupted, asyncio.Event) else None,
+            )
+            if waited and outcome is not None and outcome.get("interrupt_requested") is True:
+                # Interrupted while it waited behind the CLI's own turn: the
+                # interrupt stopped that turn, and this prompt was never sent
+                # and never will be.
+                self._end_undispatched_turn(state, generation)
+                return
+            queue = self._open_consumer(state)
+            reading = True
+            # Under --replay-user-messages the CLI echoes this prompt's uuid
+            # when it starts the prompt's turn, and only then.  A turn the CLI
+            # started by itself may still be ahead of it with no frame read
+            # yet; everything before the echo belongs to that turn.
+            echo: str | None = None
+            if _replays_prompts(client):
+                echo = str(uuid.uuid4())
+                await client.query(_echoed_prompt(prompt, echo))
+            else:
+                await client.query(prompt)
+            # Only a CLI process that has echoed a prompt is waited on: a
+            # version that takes the flag and never echoes would otherwise
+            # hold the turn forever.  Until the first echo the turn keeps the
+            # handling it had without the flag, which is safe there because
+            # the CLI starts a turn by itself only after a turn of ours.
+            # Echoing is fixed for the life of the process, so once seen, a
+            # result before the echo is the CLI's own turn and waiting for
+            # the echo cannot hang.
+            await_echo = echo is not None and state.get("echoing_client") is client
             parent_finished = False
             # ``receive_response`` stops at the parent's ResultMessage.  This
             # shared reader instead remains responsible for exact child
             # lifecycle until the already-known children have settled.  An
             # error/aborted parent result is still a parent terminal, never a
             # reason to abandon its children's control and completion frames.
-            async for message in client.receive_messages():
+            while True:
+                try:
+                    message = await self._next_frame(state, queue)
+                except StopAsyncIteration:
+                    if await_echo and outcome is not None and outcome.get("interrupt_requested") is True:
+                        self._end_undispatched_turn(state, generation, "interrupted_before_echo")
+                        return
+                    break
+                if echo is not None:
+                    if (
+                        type(message).__name__ == "UserMessage"
+                        and getattr(message, "uuid", None) == echo
+                        and getattr(message, "parent_tool_use_id", None) is None
+                    ):
+                        echo = None
+                        state["echoing_client"] = client
+                        if await_echo:
+                            # The CLI's own turn ended before this one started.
+                            self._end_unsolicited(reservation_id, state, status="completed")
+                        await_echo = False
+                        continue
+                    if await_echo:
+                        # These frames follow the turn before this one.
+                        current = state.get("turn_reference")
+                        state["turn_reference"] = state.get("prior_turn_reference")
+                        try:
+                            self._record_unsolicited(reservation_id, state, message)
+                        finally:
+                            state["turn_reference"] = current
+                        if (
+                            type(message).__name__ == "ResultMessage"
+                            and outcome is not None
+                            and outcome.get("interrupt_requested") is True
+                        ):
+                            # The CLI drops a queued prompt on an interrupt,
+                            # so its echo will never come: the abort result
+                            # is the last frame this turn gets.
+                            self._end_undispatched_turn(state, generation, "interrupted_before_echo")
+                            return
+                        continue
                 terminal = type(message).__name__ == "ResultMessage"
                 if terminal and not parent_finished:
                     self._settle_pending_native_children(reservation_id, generation, state)
@@ -1514,6 +2056,8 @@ class _Bridge:
             self._fail_turn_outcome(state, generation, bridge_error)
             raise BridgeError(f"Claude query failed: {type(exc).__name__}: {exc}") from exc
         finally:
+            if reading:
+                self._release_consumer(reservation_id, state, queue)
             # An operator reading the run record could not tell a hook that
             # never arrived from a join that failed: the enrollment counters
             # lived only inside this process.  One content-free snapshot per
@@ -1950,6 +2494,14 @@ class _Bridge:
                 return self._sdk.PermissionResultDeny(message=message, interrupt=False)
             turn_reference = state.get("turn_reference") if isinstance(state, Mapping) else None
             task = state.get("task") if isinstance(state, Mapping) else None
+            if isinstance(state, Mapping) and not isinstance(state.get("consumer"), asyncio.Queue) and self._pump_alive(state):
+                # No vNext turn is reading, so this call belongs to a turn the
+                # CLI started itself.  It goes to the same reviewer under the
+                # turn that one followed; refusing it stopped the CLI's turn.
+                unsolicited = state.get("unsolicited")
+                if isinstance(unsolicited, dict):
+                    turn_reference = unsolicited.get("after_turn_reference")
+                task = state.get("pump")
             if not isinstance(turn_reference, str) or not turn_reference or not isinstance(task, asyncio.Task):
                 return self._sdk.PermissionResultDeny(message="missing local approval routing handle", interrupt=True)
             pending = state.get("pending_permissions")
@@ -1958,6 +2510,9 @@ class _Bridge:
             permission_signal("review_requested")
             decision: asyncio.Future[Mapping[str, Any]] = asyncio.get_running_loop().create_future()
             pending[tool_use_id] = decision
+            # The answer names the turn this request went out under, which
+            # start_turn may have moved on from by the time it arrives.
+            state.setdefault("permission_turns", {})[tool_use_id] = turn_reference
             event: dict[str, Any] = {
                 "name": "permission",
                 "reservation_id": reservation_id,
@@ -1999,6 +2554,7 @@ class _Bridge:
                 resolved = await decision
             finally:
                 pending.pop(tool_use_id, None)
+                state["permission_turns"].pop(tool_use_id, None)
             # A decision carries a reason beside it now.  A bare verdict still
             # arrives from anything that resolves this future directly, so it
             # is read as a decision with no reason given.
@@ -2053,6 +2609,11 @@ class _Bridge:
             setting_sources=["user", "project", "local"],
             skills="all",
             include_partial_messages=True,
+            # The CLI echoes each prompt when its turn starts, which is the
+            # only frame that tells a vNext turn from one the CLI started by
+            # itself (_run_query).
+            **({"extra_args": {_REPLAY_FLAG: None}}
+               if "extra_args" in getattr(self._sdk.ClaudeAgentOptions, "__dataclass_fields__", {}) else {}),
             # These are provider observations, not an assertion that every
             # native child can already be adopted.  They give the bridge the
             # task IDs/parent links needed to decide that from evidence.
@@ -2061,12 +2622,23 @@ class _Bridge:
             # The clock is registered for every worker.  Native-child
             # bookkeeping still needs tool definitions and a ledger, so those
             # three stay gated.
+            # Every hook here answers from local state at once, so a bounded
+            # wait costs nothing when the bridge is healthy and caps what each
+            # tool call loses when it is not (3-4 October: every call waited
+            # out the CLI's default).  Approvals that wait on a person go
+            # through can_use_tool, which is not a hook and keeps no bound.
             hooks={
-                "PostToolUse": [self._sdk.HookMatcher(matcher=None, hooks=[clock_hook])],
+                "PostToolUse": [self._sdk.HookMatcher(matcher=None, hooks=[clock_hook], timeout=_HOOK_TIMEOUT_SECONDS)],
                 **({
-                    "PreToolUse": [self._sdk.HookMatcher(matcher=None, hooks=[native_child_hook])],
-                    "SubagentStart": [self._sdk.HookMatcher(matcher=None, hooks=[native_subagent_start_hook])],
-                    "SubagentStop": [self._sdk.HookMatcher(matcher=None, hooks=[native_subagent_stop_hook])],
+                    "PreToolUse": [self._sdk.HookMatcher(
+                        matcher=None, hooks=[native_child_hook], timeout=_HOOK_TIMEOUT_SECONDS,
+                    )],
+                    "SubagentStart": [self._sdk.HookMatcher(
+                        matcher=None, hooks=[native_subagent_start_hook], timeout=_HOOK_TIMEOUT_SECONDS,
+                    )],
+                    "SubagentStop": [self._sdk.HookMatcher(
+                        matcher=None, hooks=[native_subagent_stop_hook], timeout=_HOOK_TIMEOUT_SECONDS,
+                    )],
                 } if native_children_enabled else {}),
             },
             effort=effort,
@@ -2929,7 +3501,41 @@ class _Bridge:
             pending.pop(call_id, None)
             pending_turns.pop(call_id, None)
 
-    def _emit_message(self, reservation_id: str, generation: int, message: Any) -> None:
+    @staticmethod
+    def _track_hook_failures(target: dict[str, Any], message: Any) -> None:
+        """Keep the trailing run of tool results that failed in a hook.
+
+        A result that did not fail in a hook ends the run: the model got past
+        it.  What is left when the turn ends is what it could not get past.
+        """
+
+        if getattr(message, "parent_tool_use_id", None) is not None:
+            return
+        content = getattr(message, "content", None)
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if type(block).__name__ != "ToolResultBlock":
+                continue
+            line = _hook_failure_line(block)
+            if line is None:
+                target["hook_failures"] = []
+            else:
+                failures = target.get("hook_failures")
+                if not isinstance(failures, list):
+                    failures = target["hook_failures"] = []
+                failures.append(line)
+
+    @staticmethod
+    def _hook_failure_summary(target: Mapping[str, Any]) -> dict[str, Any] | None:
+        failures = target.get("hook_failures")
+        if not isinstance(failures, list) or not failures:
+            return None
+        return {"count": len(failures), "first": failures[0]}
+
+    def _emit_message(
+        self, reservation_id: str, generation: int, message: Any, *, unsolicited: bool = False,
+    ) -> None:
         state = self._reservations.get(reservation_id)
         if state is None:
             raise BridgeError("Claude emitted a stale local generation")
@@ -2948,10 +3554,15 @@ class _Bridge:
         if source == "StreamEvent":
             self._emit_stream_event(reservation_id, generation, state, message)
             return
+        if source == "SystemMessage":
+            self._emit_system_message(reservation_id, generation, state, message)
+            return
         if source not in {"AssistantMessage", "ResultMessage", "UserMessage"}:
             return
         if source == "UserMessage":
             self._observe_native_agent_result(state, message, reservation_id=reservation_id)
+            turn = state.get("unsolicited")
+            self._track_hook_failures(turn if unsolicited and isinstance(turn, dict) else state, message)
         if source == "AssistantMessage" and getattr(message, "parent_tool_use_id", None) is None:
             # The worker's own reply names the model that really answered.
             # A forwarded Agent-tool child carries a parent tool id and its
@@ -2966,15 +3577,20 @@ class _Bridge:
             if current is not None and current != session_id:
                 raise BridgeError("Claude emitted conflicting native session identities")
             state["session_id"] = session_id
-            self._write_turn_event(
-                state,
-                {
-                    "name": "result" if source == "ResultMessage" else "system",
-                    "reservation_id": reservation_id,
-                    "generation": generation,
-                    "native_identity": {"session_id": session_id, "source": source},
-                },
-            )
+            # The adapter publishes the next generation before the bridge
+            # sees start_turn, so an identity event from an unsolicited turn
+            # in that window would read as stale and end the adapter.  The
+            # session was bound by the vNext turn that came before it.
+            if not unsolicited:
+                self._write_turn_event(
+                    state,
+                    {
+                        "name": "result" if source == "ResultMessage" else "system",
+                        "reservation_id": reservation_id,
+                        "generation": generation,
+                        "native_identity": {"session_id": session_id, "source": source},
+                    },
+                )
             self._flush_pending_effects(reservation_id, generation, state)
             self._flush_pending_messages(reservation_id, generation, state)
         if source == "AssistantMessage" and _native_session_id(state.get("session_id")):
@@ -2987,7 +3603,7 @@ class _Bridge:
             if isinstance(resolver, NativeChildAutomaticResolver):
                 self._refresh_pending_automatic_metadata(state, resolver, state["session_id"])
                 self._replay_automatic_native_children(reservation_id, generation, state, resolver.resolve_ready())
-        projected = self._project_message(message, source)
+        projected = self._project_message(message, source, tool_inputs=state.get("tool_inputs") is True)
         if projected is not None:
             transcript = state.get("transcript")
             if transcript is None:
@@ -3025,11 +3641,15 @@ class _Bridge:
             self._write_turn_event(state, error_event)
         if source == "ResultMessage":
             terminal = self._terminal_projection(message)
-            state["terminal"] = terminal
+            if not unsolicited:
+                state["terminal"] = terminal
             # A Result may carry the empty/default session sentinel before a
             # real provider identity is attested.  Let the reader turn that
             # into its exact failure before resolving the primary waiter.
-            if _native_session_id(state.get("session_id")):
+            # The result of a turn the CLI started by itself answers no vNext
+            # prompt: start_turn may already have opened the next generation,
+            # and this result must not settle it.
+            if not unsolicited and _native_session_id(state.get("session_id")):
                 self._complete_turn_outcome(state, generation, terminal)
             usage_event = {
                 "name": "usage",
@@ -3072,6 +3692,42 @@ class _Bridge:
             "turn_reference": state.get("turn_reference"),
             "generation": generation,
             "content": content,
+        })
+
+    def _emit_system_message(self, reservation_id: str, generation: int, state: dict[str, Any], message: Any) -> None:
+        """Forward a CLI system message with only its allowlisted fields.
+
+        The raw data also carries the working directory, plugin and memory
+        paths, MCP server sources and error records that can hold URLs with
+        tokens.  None of those leave the bridge.  It is never an identity
+        source: the session id here is display data, and binding stays with
+        the assistant and result frames.
+        """
+
+        subtype = getattr(message, "subtype", None)
+        raw = getattr(message, "data", None)
+        if not isinstance(subtype, str) or not isinstance(raw, Mapping):
+            return
+        data = {key: raw[key] for key in _SYSTEM_MESSAGE_FIELDS.get(subtype, ("session_id",)) if key in raw}
+        if subtype == "init" and isinstance(data.get("mcp_servers"), list):
+            data["mcp_servers"] = [
+                {key: server[key] for key in ("name", "status") if key in server}
+                for server in data["mcp_servers"]
+                if isinstance(server, Mapping)
+            ]
+        if subtype == "compact_boundary" and isinstance(data.get("compact_metadata"), Mapping):
+            data["compact_metadata"] = {
+                key: data["compact_metadata"][key]
+                for key in ("trigger", "pre_tokens")
+                if key in data["compact_metadata"]
+            }
+        self._release_or_hold_message(state, {
+            "name": "system_message",
+            "reservation_id": reservation_id,
+            "turn_reference": state.get("turn_reference"),
+            "generation": generation,
+            "subtype": subtype,
+            "data": data,
         })
 
     def _release_or_hold_message(self, state: dict[str, Any], event: Mapping[str, Any]) -> None:
@@ -3279,15 +3935,15 @@ class _Bridge:
         pending.pop(key, None)
 
     @classmethod
-    def _project_message(cls, message: Any, source: str) -> dict[str, Any] | None:
+    def _project_message(cls, message: Any, source: str, *, tool_inputs: bool = False) -> dict[str, Any] | None:
         if source == "UserMessage":
             content = getattr(message, "content", None)
-            blocks = cls._project_content(content)
+            blocks = cls._project_content(content, tool_inputs=tool_inputs)
             return {"role": "user", "content": blocks}
         if source == "AssistantMessage":
             projected = {
                 "role": "assistant",
-                "content": cls._project_content(getattr(message, "content", None)),
+                "content": cls._project_content(getattr(message, "content", None), tool_inputs=tool_inputs),
                 "model": getattr(message, "model", None),
                 "stop_reason": getattr(message, "stop_reason", None),
             }
@@ -3303,7 +3959,7 @@ class _Bridge:
         return None
 
     @classmethod
-    def _project_content(cls, content: object) -> list[dict[str, Any]]:
+    def _project_content(cls, content: object, *, tool_inputs: bool = False) -> list[dict[str, Any]]:
         if isinstance(content, str):
             return [{"type": "text", "text": content}]
         if not isinstance(content, list):
@@ -3320,7 +3976,10 @@ class _Bridge:
                 # and credentials.  The event is an observability stream, not
                 # a second plaintext command log, so retain the fact and ID
                 # without copying that material out of the provider session.
-                blocks.append({"type": "tool_use", "id": getattr(block, "id", None), "name": getattr(block, "name", None), "input": {}})
+                # A session that set claude_tool_inputs asked for the copy;
+                # its run log and the host history then hold the arguments.
+                arguments = cls._bounded_tool_input(getattr(block, "input", {})) if tool_inputs else {}
+                blocks.append({"type": "tool_use", "id": getattr(block, "id", None), "name": getattr(block, "name", None), "input": arguments})
             elif block_type == "ToolResultBlock":
                 blocks.append({"type": "tool_result", "tool_use_id": getattr(block, "tool_use_id", None), "is_error": getattr(block, "is_error", None)})
             elif block_type == "ServerToolUseBlock":
@@ -3328,6 +3987,20 @@ class _Bridge:
             elif block_type == "ServerToolResultBlock":
                 blocks.append({"type": "server_tool_result", "tool_use_id": getattr(block, "tool_use_id", None), "content": getattr(block, "content", None)})
         return blocks
+
+    @staticmethod
+    def _bounded_tool_input(value: object) -> dict[str, Any]:
+        """Copy tool arguments, or a preview when they would break the JSONL bound.
+
+        A Write of an ordinary large file can exceed _MAX_JSONL by itself, and
+        an event that fails _write fails the whole turn.
+        """
+
+        arguments = dict(value or {})
+        encoded = json.dumps(arguments, ensure_ascii=True, default=str)
+        if len(encoded) <= _TOOL_INPUT_MAX_CHARS:
+            return arguments
+        return {"_vnext_truncated": True, "chars": len(encoded), "preview": encoded[:_TOOL_INPUT_PREVIEW_CHARS]}
 
     @staticmethod
     def _terminal_projection(message: Any) -> dict[str, Any]:
@@ -3640,6 +4313,7 @@ class _Bridge:
                     if isinstance(completion, asyncio.Future) and not completion.done():
                         completion.cancel()
             state["task"] = None
+            await self._stop_pump(state)
             client = state.get("client")
             if client is not None:
                 await client.disconnect()
