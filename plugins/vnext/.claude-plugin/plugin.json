@@ -1,7 +1,7 @@
 {
   "name": "vnext",
   "description": "Give Claude Code a vNext workforce: delegate bounded work to Codex and Claude workers, await their evidence, and judge it.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "mcpServers": "./.mcp.json",
   "author": {
     "name": "RazAndAlex"
