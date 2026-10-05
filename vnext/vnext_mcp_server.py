@@ -22,6 +22,7 @@ import json
 import math
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -239,6 +240,11 @@ def _external_tools(
         replacement = EXTERNAL_TOOL_DESCRIPTIONS.get(name)
         if replacement is not None:
             entry["description"] = replacement
+        if name == "delegate":
+            entry["description"] = str(entry.get("description", "")) + (
+                " A client that cannot be woken by vNext can run the returned "
+                "wake_command in the background to wake when the child stops or its deadline passes."
+            )
         # Both tools that choose a model carry the roster.
         if roster and name in {"delegate", "replace"}:
             entry["description"] = str(entry.get("description", "")) + roster
@@ -1431,6 +1437,15 @@ class VNextMcpService:
             result = self.session.external_tool_call(tool=tool, arguments=arguments)
         except Exception as exc:
             return {"success": False, "error": str(exc), "error_code": "external-dispatch"}
+        if tool == "delegate" and isinstance(result, ToolCallResult) and result.success:
+            command = [
+                sys.executable, "-m", "vnext.vnext_wait",
+                "--workspace", str(self.workspace.resolve()),
+                "--agent", str(result.value["agent_id"]),
+                "--session", self._session_id, "--deadline", "30m",
+            ]
+            wake_command = subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
+            result = ToolCallResult(True, {**dict(result.value), "wake_command": wake_command})
         notice = list(getattr(self, "_runtime_notice", None) or ())
         # The disk is read only for the two answers that carry the sentence.
         freshness = (

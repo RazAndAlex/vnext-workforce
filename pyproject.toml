@@ -19,6 +19,7 @@ claude = ["claude-agent-sdk==0.2.163"]
 vnext-mcp = "vnext.vnext_mcp_reload:main"
 vnext-mcp-server = "vnext.vnext_mcp_server:main"
 vnext-report = "vnext.vnext_report:main"
+vnext-wait = "vnext.vnext_wait:main"
 
 [dependency-groups]
 # pytest-subtests is what reports a failure inside unittest's subTest on pytest

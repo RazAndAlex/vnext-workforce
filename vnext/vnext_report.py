@@ -128,30 +128,34 @@ def _numbered_rows(path: Path) -> Iterator[tuple[int | str, dict[str, Any]]]:
                                  "cause": str(exc)}
         return
     for line_number, raw in enumerate(data.splitlines(), 1):
-        if not raw.strip():
-            continue
-        # Bytes that are not UTF-8 were once replaced in silence, and a damaged
-        # "provider.error" became a word nothing looked for.
-        try:
-            line = raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            yield line_number, {"type": "unreadable.record", "where": f"line {line_number}",
-                               "cause": f"the line is not UTF-8 ({exc.reason} at byte {exc.start})"}
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as exc:
-            # Keep reading later lines and report the parse error without
-            # guessing whether the cause was a truncated write or interleaving.
-            yield line_number, {"type": "unreadable.record", "where": f"line {line_number}",
-                               "cause": str(exc)}
-            continue
-        if isinstance(row, dict):
+        row = _parse_row(raw, line_number)
+        if row is not None:
             yield line_number, row
-        else:
-            held = "null" if row is None else type(row).__name__
-            yield line_number, {"type": "unreadable.record", "where": f"line {line_number}",
-                               "cause": f"the line holds JSON {held} where a record object belongs"}
+
+
+def _parse_row(raw: bytes, line_number: int) -> dict[str, Any] | None:
+    """Parse one line, sharing report diagnostics with incremental readers."""
+    if not raw.strip():
+        return None
+    # Bytes that are not UTF-8 were once replaced in silence, and a damaged
+    # "provider.error" became a word nothing looked for.
+    try:
+        line = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return {"type": "unreadable.record", "where": f"line {line_number}",
+                "cause": f"the line is not UTF-8 ({exc.reason} at byte {exc.start})"}
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError as exc:
+        # Keep reading later lines and report the parse error without
+        # guessing whether the cause was a truncated write or interleaving.
+        return {"type": "unreadable.record", "where": f"line {line_number}",
+                "cause": str(exc)}
+    if isinstance(row, dict):
+        return row
+    held = "null" if row is None else type(row).__name__
+    return {"type": "unreadable.record", "where": f"line {line_number}",
+            "cause": f"the line holds JSON {held} where a record object belongs"}
 
 
 def _run_logs(home: Path) -> list[Path]:
