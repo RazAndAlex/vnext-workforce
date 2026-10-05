@@ -185,35 +185,46 @@ helper from npm, so it needs a network connection. The helper keeps about
 <summary><b>Keeping up with new models</b></summary>
 
 A new model usually comes with a new release of the Codex CLI or of the Claude
-Agent SDK. Once a day, vNext asks PyPI for the newest release of each. When one
-is newer, `vnext-mcp --check` and the `inspect` tool show a line such as:
+Agent SDK. Once a day, vNext asks PyPI for the newest stable release of each.
+It automatically installs newer versions into a fresh folder under
+`~/.vnext/runtimes/`, about 560 MB, and verifies both programs and their model
+lists without sending a prompt. Running workers keep using their current pair.
+`vnext-mcp --check` and `inspect` report when an update is ready, which pair
+switched at startup, or why an update failed.
 
-```
-openai-codex 0.161.0 is out (vNext runs 0.160.0). Tell your agent: update vNext runtimes (vnext-mcp --update-runtimes)
-```
+A verified update applies at the next server start. Nothing restarts the
+server automatically. A restart stops running workers, so restart when none
+are running. A new Codex model that vNext has not run yet shows as "not tested
+by vNext". A failed update keeps the current runtime. Promotion also checks
+that the new runtime covers the catalog this server will load; an incompatible
+pair stays staged and the current pair runs.
 
-To install the newer versions, run:
+Automatic attempts are limited to once per pair per day, even if an install is
+interrupted. Failed builds are removed. After a promotion, unreferenced runtime
+folders older than 14 days are removed; active, previous and staged pairs and
+the pinned bundle are retained.
+
+To install a pair explicitly, or choose versions with `--codex-version` and
+`--sdk-version`, run:
 
 ```
 vnext-mcp --update-runtimes
 ```
 
-This puts both programs in a separate folder under `~/.vnext/runtimes/`, about
-560 MB. Your vNext install stays as it is. The command asks each program for
-its model list without sending a prompt. A new Codex model that vNext has not
-run yet shows as "not tested by vNext". If the new versions cannot run vNext,
-the command says why and changes nothing.
+An explicit update replaces staging, preserves the current pair for rollback,
+and clears automatic-update notices.
 
-The new versions start to work when the server restarts. A restart stops the
-workers that are running, so restart when none are. To go back to the versions
-that came with vNext, run:
+To restore the previous pair (or the versions shipped with vNext when there
+was no side runtime), run:
 
 ```
 vnext-mcp --update-runtimes --rollback
 ```
 
-Set `VNEXT_NO_UPDATE_CHECK=1` to stop the daily check. Set
-`VNEXT_RUNTIMES_DIR` to keep the new versions in another folder.
+Rollback keeps installed folders and declines that pair for automatic updates.
+Set `VNEXT_AUTO_UPDATE=0` for daily notices and manual installation only.
+Set `VNEXT_NO_UPDATE_CHECK=1` to disable daily checks and automatic installation.
+Set `VNEXT_RUNTIMES_DIR` to keep new versions in another folder.
 
 </details>
 

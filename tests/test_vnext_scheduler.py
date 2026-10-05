@@ -46,7 +46,9 @@ from vnext.vnext_scheduler import (
     SchedulerError,
     SchedulerHooks,
     VNextScheduler,
+    _BlockReported,
     _TurnFinished,
+    _UnsolicitedTurnEnded,
     _objective_line,
     _safe_detail,
 )
@@ -103,6 +105,23 @@ def payload(result) -> dict:
     value = json.loads(result.as_json_text())
     value["success"] = result.success
     return value
+
+
+def _deliver_reported_blocks(scheduler) -> None:
+    """Do what the scheduler loop does with the events report_blocked queues.
+
+    Matched by name so this file still runs on a tree without the event,
+    where a test that needs it fails on its assertions.
+    """
+
+    pending = []
+    while not scheduler._events.empty():
+        pending.append(scheduler._events.get_nowait())
+    for event in pending:
+        if type(event).__name__ == "_BlockReported":
+            scheduler._handle_block_reported(event)
+        else:
+            scheduler._events.put(event)
 
 
 class ScriptedAdapter:
@@ -2368,6 +2387,205 @@ class VNextSchedulerTests(unittest.TestCase):
         self.assertEqual(AgentStatus.READY, child.status)
         self.assertEqual(
             ["child-blocked"], [wake["reason"] for wake in session.wakes[record.agent_id]],
+        )
+
+    _TOKEN_REASON = "needs a GitHub token for the release repository"
+    _REPORTED_BLOCKER = (
+        "reported by the worker: needs a GitHub token for the release repository. "
+        "Answer with send_message, then retry it, to resume it on the same session"
+    )
+
+    def _worker_in_a_turn(self, scheduler):
+        worker = self.control.spawn_agent(
+            requester_id=self.root.agent_id,
+            parent_agent_id=self.root.agent_id,
+            role=AgentRole.WORKER, model_id=WORKER,
+            objective="Publish the release",
+            task_contract={"criteria": ["release published"]},
+        )
+        self.control.start_turn(worker.agent_id, thread_id="thread-w")
+        return worker
+
+    def _end_worker_turn(self, scheduler, worker, result):
+        scheduler._handle_turn_finished(_TurnFinished(
+            worker.agent_id,
+            types.SimpleNamespace(
+                agent_id=worker.agent_id, provider="claude", phase="work",
+                control_turn_id="control-turn-w",
+                runtime=types.SimpleNamespace(thread_id="thread-w", turn_id="native-w"),
+            ),
+            result=result,
+        ))
+
+    def test_a_worker_that_reports_blocked_is_blocked_when_its_turn_ends(self) -> None:
+        """A worker that cannot go on says so, and its manager is woken with why."""
+
+        scheduler, record, _branch = self._resumable_root_with_one_worker()
+        scheduler.hooks = SchedulerHooks(lifecycle=lambda *args: None)
+        session = self.control.sessions[self.root.session_id]
+        worker = self._worker_in_a_turn(scheduler)
+
+        answer = payload(scheduler._manager_handler(
+            worker.agent_id, "report_blocked", {"reason": self._TOKEN_REASON}, None,
+        ))
+        _deliver_reported_blocks(scheduler)
+
+        self.assertTrue(answer["success"], answer)
+        self.assertIn("End your turn now", answer["message"])
+        # The tool only records the reason: the turn is still the worker's.
+        self.assertEqual(AgentStatus.RUNNING, worker.status)
+        self.assertEqual([], session.wakes.get(record.agent_id, []))
+
+        self._end_worker_turn(scheduler, worker, {"status": "completed"})
+
+        self.assertEqual(AgentStatus.BLOCKED, worker.status)
+        self.assertEqual(self._REPORTED_BLOCKER, worker.blocker)
+        self.assertEqual(
+            ["child-blocked"], [wake["reason"] for wake in session.wakes[record.agent_id]],
+        )
+        inspected = payload(scheduler._manager_handler(
+            record.agent_id, "inspect", {"agent_id": worker.agent_id, "deep": False}, None,
+        ))
+        self.assertEqual(self._REPORTED_BLOCKER, inspected["agent"]["blocker"])
+
+    def test_the_primary_cannot_report_itself_blocked(self) -> None:
+        """The primary talks to its user directly and has no manager to wake."""
+
+        scheduler, record, _branch = self._resumable_root_with_one_worker()
+        self.control.start_turn(record.agent_id)
+
+        answer = payload(scheduler._manager_handler(
+            record.agent_id, "report_blocked", {"reason": self._TOKEN_REASON}, None,
+        ))
+
+        self.assertFalse(answer["success"], answer)
+        self.assertEqual("primary-reports-to-user", answer["error_code"])
+        self.assertIn("ask your user directly", answer["error"])
+        self.assertNotIn(record.agent_id, scheduler._deferred_blockers)
+
+    def test_a_message_alone_leaves_a_reported_block_in_place(self) -> None:
+        """send_message only queues mail for a blocked worker; retry resumes it."""
+
+        scheduler, record, _branch = self._resumable_root_with_one_worker()
+        scheduler.hooks = SchedulerHooks(lifecycle=lambda *args: None)
+        worker = self._worker_in_a_turn(scheduler)
+        payload(scheduler._manager_handler(
+            worker.agent_id, "report_blocked", {"reason": self._TOKEN_REASON}, None,
+        ))
+        _deliver_reported_blocks(scheduler)
+        self._end_worker_turn(scheduler, worker, {"status": "completed"})
+
+        sent = payload(scheduler._manager_handler(record.agent_id, "send_message", {
+            "agent_id": worker.agent_id, "message": "the token is in RELEASE_TOKEN",
+        }, None))
+        self.assertTrue(sent["success"], sent)
+        self.assertEqual(AgentStatus.BLOCKED, worker.status)
+
+        retried = payload(scheduler._manager_handler(record.agent_id, "retry", {
+            "agent_id": worker.agent_id, "task_contract": {"criteria": ["release published"]},
+        }, None))
+        self.assertTrue(retried["success"], retried)
+        self.assertEqual(AgentStatus.READY, worker.status)
+        self.assertEqual("", worker.blocker)
+
+    def test_a_report_the_loop_sees_after_the_turn_ended_still_blocks(self) -> None:
+        """The turn can end between the tool call and the loop's bookkeeping.
+
+        The tool used to read and then write the deferred map from the
+        handler thread.  An interrupt that ended the turn between the two
+        left the reason in the map after the turn's end had emptied it: the
+        worker sat READY and its parent was never woken.
+        """
+
+        scheduler, record, _branch = self._resumable_root_with_one_worker()
+        scheduler.hooks = SchedulerHooks(lifecycle=lambda *args: None)
+        session = self.control.sessions[self.root.session_id]
+        worker = self._worker_in_a_turn(scheduler)
+        ended = []
+        test = self
+
+        class TurnEndsDuringLookup(dict):
+            def get(self, key, default=None):
+                if not ended:
+                    ended.append(True)
+                    test._end_worker_turn(scheduler, worker, {"status": "interrupted"})
+                return super().get(key, default)
+
+        scheduler._deferred_blockers = TurnEndsDuringLookup()
+        scheduler._interrupted_agents.add(worker.agent_id)
+
+        answer = payload(scheduler._manager_handler(
+            worker.agent_id, "report_blocked", {"reason": self._TOKEN_REASON}, None,
+        ))
+        self.assertTrue(answer["success"], answer)
+        if not ended:
+            ended.append(True)
+            self._end_worker_turn(scheduler, worker, {"status": "interrupted"})
+        self.assertEqual(AgentStatus.READY, worker.status)
+        _deliver_reported_blocks(scheduler)
+
+        self.assertEqual(AgentStatus.BLOCKED, worker.status)
+        self.assertEqual(self._REPORTED_BLOCKER, worker.blocker)
+        self.assertEqual(
+            ["child-blocked"], [wake["reason"] for wake in session.wakes[record.agent_id]],
+        )
+        self.assertNotIn(worker.agent_id, scheduler._deferred_blockers)
+
+    def _cancel_during_block(self, handle) -> None:
+        """A cancel from the handler thread lands between the READY check and the block."""
+
+        scheduler, record, _branch = self._resumable_root_with_one_worker()
+        scheduler.hooks = SchedulerHooks(lifecycle=lambda *args: None)
+        session = self.control.sessions[self.root.session_id]
+        worker = self._worker_in_a_turn(scheduler)
+        self._end_worker_turn(scheduler, worker, {"status": "completed"})
+        self.assertEqual(AgentStatus.READY, worker.status)
+        wakes_before = list(session.wakes.get(record.agent_id, []))
+        original = scheduler._record_stopped_progress
+
+        def cancel_first(*args, **kwargs):
+            self.control.cancel_agent(requester_id=record.agent_id, agent_id=worker.agent_id)
+            return original(*args, **kwargs)
+
+        scheduler._record_stopped_progress = cancel_first
+
+        handle(scheduler, worker)
+
+        self.assertEqual(AgentStatus.CANCELLED, worker.status)
+        self.assertNotIn(
+            "child-blocked",
+            [wake["reason"] for wake in session.wakes.get(record.agent_id, [])[len(wakes_before):]],
+        )
+
+    def test_a_cancel_racing_a_reported_block_does_not_stop_the_loop(self) -> None:
+        self._cancel_during_block(lambda scheduler, worker: scheduler._handle_block_reported(
+            _BlockReported(worker.agent_id, self._TOKEN_REASON),
+        ))
+
+    def test_a_cancel_racing_a_hook_failure_block_does_not_stop_the_loop(self) -> None:
+        self._cancel_during_block(lambda scheduler, worker: scheduler._handle_unsolicited_turn_ended(
+            _UnsolicitedTurnEnded(worker.agent_id, {}, blocker="hooks failed"),
+        ))
+
+    def test_a_reported_block_is_dropped_when_the_turn_fails(self) -> None:
+        """A failed turn is the parent's news; the report does not wake it twice."""
+
+        scheduler, record, _branch = self._resumable_root_with_one_worker()
+        scheduler.hooks = SchedulerHooks(lifecycle=lambda *args: None)
+        session = self.control.sessions[self.root.session_id]
+        worker = self._worker_in_a_turn(scheduler)
+        answer = payload(scheduler._manager_handler(
+            worker.agent_id, "report_blocked", {"reason": self._TOKEN_REASON}, None,
+        ))
+        self.assertTrue(answer["success"], answer)
+
+        self._end_worker_turn(scheduler, worker, {"status": "failed"})
+
+        self.assertEqual(AgentStatus.FAILED, worker.status)
+        self.assertNotIn("reported by the worker", worker.blocker)
+        self.assertNotIn(worker.agent_id, scheduler._deferred_blockers)
+        self.assertEqual(
+            ["child-failed"], [wake["reason"] for wake in session.wakes[record.agent_id]],
         )
 
     def test_a_provider_stream_that_ends_between_turns_blocks_a_resting_worker(self) -> None:
@@ -6923,6 +7141,83 @@ class VNextSchedulerTests(unittest.TestCase):
         self.assertEqual("provider-native-task", child.result["source"])
         self.assertNotIn("decision", child.result)
 
+    def _native_child_in_a_turn(self, scheduler, name):
+        self.assertTrue(scheduler._bind_agent(self.root))
+        binding = scheduler.adopt_native_child(NativeChildObservation(
+            provider="fixture", parent_agent_id=self.root.agent_id,
+            parent_thread_id=self.managed._threads[self.root.agent_id],
+            native_child_thread_id=name, attested=True,
+            delivery_contract={"context_messages": "available", "interrupt": "available"},
+            model_id=WORKER, role=AgentRole.WORKER.value, objective="native work"))
+        child = self.control.sessions[self.root.session_id].agents[binding.agent_id]
+        turn = scheduler.adopt_native_turn(agent_id=child.agent_id, provider="fixture",
+                                          thread_id=child.thread_id, turn_id=f"{name}-turn", cursor=0)
+        return child, turn
+
+    def _report(self, scheduler, child, reason):
+        answer = payload(scheduler._manager_handler(
+            child.agent_id, "report_blocked", {"reason": reason}, None,
+        ))
+        self.assertTrue(answer["success"], answer)
+        _deliver_reported_blocks(scheduler)
+
+    def test_a_native_child_that_reports_blocked_is_not_completed_by_its_task_end(self) -> None:
+        """A Claude child ends its turn normally after report_blocked.
+
+        That end arrives as a native task end, which used to complete the
+        child: the parent heard child-completed, the reason was lost, and
+        send_message and retry were both refused.
+        """
+
+        scheduler = self._scheduler()
+        session = self.control.sessions[self.root.session_id]
+        child, turn = self._native_child_in_a_turn(scheduler, "native-reports-blocked")
+        self._report(scheduler, child, "needs a GitHub token")
+
+        scheduler._handle_turn_finished(_TurnFinished(child.agent_id, turn,
+            result={"status": "completed", "native_task_terminal": True, "summary": "blocked"}))
+
+        self.assertEqual(AgentStatus.BLOCKED, child.status)
+        self.assertIn("reported by the worker: needs a GitHub token", child.blocker)
+        reasons = [wake["reason"] for wake in session.wakes.get(self.root.agent_id, [])]
+        self.assertEqual(1, reasons.count("child-blocked"), reasons)
+        self.assertNotIn("child-completed", reasons)
+
+    def test_two_reports_in_one_native_turn_keep_both_reasons(self) -> None:
+        scheduler = self._scheduler()
+        session = self.control.sessions[self.root.session_id]
+        child, turn = self._native_child_in_a_turn(scheduler, "native-reports-twice")
+        self._report(scheduler, child, "needs a GitHub token")
+        self._report(scheduler, child, "the release branch is protected")
+        self._report(scheduler, child, "needs a GitHub token")
+
+        scheduler._handle_turn_finished(_TurnFinished(child.agent_id, turn,
+            result={"status": "completed", "native_task_terminal": True}))
+
+        self.assertEqual(AgentStatus.BLOCKED, child.status)
+        self.assertEqual(1, child.blocker.count("needs a GitHub token"), child.blocker)
+        self.assertIn("the release branch is protected", child.blocker)
+        reasons = [wake["reason"] for wake in session.wakes.get(self.root.agent_id, [])]
+        self.assertEqual(1, reasons.count("child-blocked"), reasons)
+
+    def test_a_native_report_keeps_the_unfinished_children_in_the_blocker(self) -> None:
+        scheduler = self._scheduler()
+        child, turn = self._native_child_in_a_turn(scheduler, "native-reports-with-child")
+        unfinished = self.control.spawn_agent(
+            requester_id=child.agent_id, parent_agent_id=child.agent_id,
+            role=AgentRole.WORKER, model_id=WORKER, objective="unfinished nested work",
+            task_contract={"criteria": ["nested work complete"]},
+        )
+        self._report(scheduler, child, "needs a GitHub token")
+
+        scheduler._handle_turn_finished(_TurnFinished(child.agent_id, turn,
+            result={"status": "completed", "native_task_terminal": True}))
+
+        self.assertEqual(AgentStatus.BLOCKED, child.status)
+        self.assertIn("reported by the worker: needs a GitHub token", child.blocker)
+        self.assertIn("1 unfinished child", child.blocker)
+        self.assertIn(unfinished.agent_id, child.blocker)
+
     def test_native_task_with_an_unfinished_child_blocks_with_child_evidence(self) -> None:
         """An unfinished child is a real blocker, and the blocker must identify it.
 
@@ -9423,6 +9718,54 @@ class WorkerMessageAdapter(ScriptedAdapter):
         return {"status": "completed", "final_response": "worker turn"}
 
 
+class ReportedBlockAdapter(WorkerMessageAdapter):
+    """A Worker that stops for a token and its manager that hands it over.
+
+    The worker's first turn calls report_blocked.  The branch manager, woken
+    by the block, answers with send_message and then retry; the worker's next
+    turn reads the answer and completes.
+    """
+
+    ANSWER = "the token is in the RELEASE_TOKEN variable"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.worker_threads: list[str] = []
+        self.blockers_seen: list[str] = []
+
+    def wait_turn(self, handle, *, timeout=300):
+        handler = self.handlers[handle.thread_id]
+        role = self.roles[handle.thread_id]
+        prompt = self.prompts[handle.thread_id][-1]
+        if role == AgentRole.WORKER.value:
+            self.worker_prompts.append(prompt)
+            self.worker_threads.append(handle.thread_id)
+            if len(self.worker_prompts) == 1:
+                self.assert_success(payload(handler(
+                    "report_blocked", {"reason": "needs a GitHub token"}, None,
+                )))
+                return {"status": "completed", "final_response": "blocked"}
+            self.assert_success(payload(handler("complete_agent", {
+                "outcome": "released", "verified": True, "evidence": ["token used"],
+            }, None)))
+            return {"status": "completed", "final_response": "worker done"}
+        if role == AgentRole.BRANCH_MANAGER.value and self.worker_ids:
+            worker_id = self.worker_ids[0]
+            agent = payload(handler("inspect", {"agent_id": worker_id, "deep": False}, None))["agent"]
+            if agent["status"] == AgentStatus.BLOCKED.value:
+                self.branch_prompts.append(prompt)
+                self.blockers_seen.append(agent["blocker"])
+                self.assert_success(payload(handler(
+                    "send_message", {"agent_id": worker_id, "message": self.ANSWER}, None,
+                )))
+                self.assert_success(payload(handler("retry", {
+                    "agent_id": worker_id, "task_contract": {"criteria": ["marker written"]},
+                }, None)))
+                self.assert_success(payload(handler("await_children", {"agent_ids": [worker_id]}, None)))
+                return {"status": "completed", "final_response": "answered the worker"}
+        return super().wait_turn(handle, timeout=timeout)
+
+
 class VNextWorkerMessageDeliveryTests(unittest.TestCase):
     """A Worker must read what it was sent before the scheduler completes it."""
 
@@ -9442,8 +9785,8 @@ class VNextWorkerMessageDeliveryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def _build(self) -> VNextScheduler:
-        self.adapter = WorkerMessageAdapter()
+    def _build(self, adapter_class=None) -> VNextScheduler:
+        self.adapter = (adapter_class or WorkerMessageAdapter)()
         runtime_effects = RuntimeEffectJournal(self.workspace)
 
         def select_adapter(agent):
@@ -9524,6 +9867,39 @@ class VNextWorkerMessageDeliveryTests(unittest.TestCase):
             "a message was marked read by a turn that never ran",
         )
         self.assertEqual(AgentStatus.BLOCKED, record.status)
+
+    def test_a_reported_block_resumes_the_same_session_with_the_answer(self) -> None:
+        """The manager's answer reaches the worker's next turn on its own thread."""
+
+        scheduler = self._build(ReportedBlockAdapter)
+
+        result = scheduler.run()
+
+        self.assertEqual("accepted", result["decision"])
+        self.assertEqual(
+            ["reported by the worker: needs a GitHub token. Answer with send_message, "
+             "then retry it, to resume it on the same session"],
+            self.adapter.blockers_seen,
+        )
+        self.assertEqual(2, len(self.adapter.worker_prompts))
+        delivered = _messages_of(self.adapter.worker_prompts[1])
+        self.assertEqual(
+            [(self.adapter.branch_ids[0], ReportedBlockAdapter.ANSWER)],
+            [(item["sender_id"], item["text"]) for item in delivered],
+        )
+        self.assertIn("[WORKER RESUME]", self.adapter.worker_prompts[1])
+        # One provider thread for the worker, used by both turns: the same
+        # session and its context, and no fresh agent.
+        worker_threads = [
+            thread for thread, role in self.adapter.roles.items()
+            if role == AgentRole.WORKER.value
+        ]
+        self.assertEqual(1, len(worker_threads))
+        self.assertEqual(worker_threads * 2, self.adapter.worker_threads)
+        session = self.control.sessions[self.root.session_id]
+        self.assertEqual(
+            AgentStatus.COMPLETED, session.agents[self.adapter.worker_ids[0]].status,
+        )
 
     def test_a_worker_with_no_message_still_completes_in_one_turn(self) -> None:
         scheduler = self._build()

@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 # not Codex subscription invoices; unlisted internal models remain unpriced.
 API_PRICES_PER_MILLION = {
     "gpt-6-astra": {"input": 10.0, "cached": 1.0, "output": 50.0},
-    # TheNewStack and VentureBeat, 2026-09-22; OpenAI's own page was not reachable. Requests over 272K input tokens pay 2x input and 1.5x output; this is not modelled.
+    # Checked 2026-10-05 against https://developers.openai.com/api/docs/pricing.
+    # Requests over 272K input tokens pay 2x input and 1.5x output; this is not modelled.
+    "gpt-6.1-sol": {"input": 2.0, "cached": 0.1, "output": 10.0},
     "gpt-6-sol": {"input": 2.0, "cached": 0.2, "output": 10.0},
     "gpt-6-luna": {"input": 0.1, "cached": 0.01, "output": 0.5},
     "gpt-5.6-sol": {"input": 5.0, "cached": 0.5, "output": 30.0},

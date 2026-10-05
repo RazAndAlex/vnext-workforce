@@ -53,6 +53,11 @@ from .vnext_runtime_effects import (
 from .vnext_runtime_types import ToolCallResult
 from .vnext_runtimes import (
     NO_UPDATE_CHECK_ENV,
+    auto_update,
+    auto_update_needed,
+    promote_staged,
+    register_runtime_in_use,
+    missing_codex_catalog_models,
     is_runtime_command,
     active_codex_slugs,
     check_for_updates,
@@ -60,6 +65,7 @@ from .vnext_runtimes import (
     codex_runtime_selection,
     read_active_runtime,
     runtime_notice_lines,
+    read_staged_runtime,
     runtime_view,
     session_runtime_config,
     untested_catalog_entries,
@@ -760,14 +766,10 @@ def _validate_catalog(
         supported = side_slugs
         runtime_label = f"side Codex runtime ({runtime_view(active)['codex']})"
     if uses_pinned_codex:
-        for entry in entries:
-            if entry.get("provider") != "codex":
-                continue
-            model = entry.get("model") or entry.get("model_id")
-            if isinstance(model, str) and model not in supported:
-                raise VNextMcpServiceError(
-                    f"Codex model {model!r} cannot be run by the {runtime_label}"
-                )
+        for model in missing_codex_catalog_models(entries, supported):
+            raise VNextMcpServiceError(
+                f"Codex model {model!r} cannot be run by the {runtime_label}"
+            )
     return entries
 
 
@@ -977,11 +979,19 @@ class VNextMcpService:
             entries, active=active_runtime, newest=newest, always=False,
         )
         self._update_check_thread: threading.Thread | None = None
-        if newest is None and os.environ.get(NO_UPDATE_CHECK_ENV) != "1":
+        if os.environ.get(NO_UPDATE_CHECK_ENV) != "1" and (
+            newest is None or (
+                auto_update_needed(newest) and read_staged_runtime() is None
+            )
+        ):
             def refresh_runtime_notice() -> None:
-                answer = check_for_updates()
+                answer = newest if newest is not None else check_for_updates()
                 # A server that closed meanwhile has no inspect left to show it.
                 if answer and not getattr(self, "_closing", False):
+                    self._runtime_notice = runtime_notice_lines(
+                        entries, active=active_runtime, newest=answer, always=False,
+                    )
+                    auto_update(answer)
                     self._runtime_notice = runtime_notice_lines(
                         entries, active=active_runtime, newest=answer, always=False,
                     )
@@ -998,8 +1008,8 @@ class VNextMcpService:
             primary={"provider": "external", "model": client, "effort": "high"},
             main_preset={"instructions": instructions},
             catalog_config={"models": [{"provider": "external", "model": client}, *entries]},
-            # A side runtime is read once, here, so a change made by
-            # --update-runtimes takes effect at the next start.
+            # The selected side runtime is held for this session; automatic
+            # updates only stage a new pair for the next process start.
             config={"external_client": client, **session_runtime_config(active_runtime)},
         )
         registered = set(adapter_factories or {}) - _BUILT_IN_PROVIDERS
@@ -2471,6 +2481,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if refusal is not None:
         print(refusal, file=sys.stderr)
         return 2
+    # All three startup reads (catalog load, validation, session config) must
+    # see the same promoted record. The separate --check path never promotes.
+    promote_staged(args.catalog)
+    register_runtime_in_use(read_active_runtime())
     # The same resolution --check reports on, so the check cannot say yes to a
     # start this would refuse.  One probe for the whole startup: the catalog load
     # and the service both ask about the local logins, and asking twice paid the

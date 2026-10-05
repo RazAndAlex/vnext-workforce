@@ -67,6 +67,9 @@ os.environ["VNEXT_CHECK_SKIP_MODEL_PROBE"] = "1"
 # No test reads PyPI, and none finds a developer's own side runtime: the update
 # check is off, and side runtimes live in a folder only this run uses.
 os.environ["VNEXT_NO_UPDATE_CHECK"] = "1"
+# Tests of the daily notice may enable checking, but only auto-update tests
+# with fake installers may enable automatic installation.
+os.environ["VNEXT_AUTO_UPDATE"] = "0"
 # A shell's own VNEXT_RUNTIMES_DIR is replaced, never trusted.  The folder made
 # here is remembered, so a second import keeps the same one.
 _SUITE_FOLDER_ENV = "VNEXT_TEST_SUITE_RUNTIMES_DIR"

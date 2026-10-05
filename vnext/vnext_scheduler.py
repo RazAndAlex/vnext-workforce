@@ -182,6 +182,14 @@ class _UnsolicitedTurnEnded:
     blocker: str | None = None
 
 
+@dataclass(frozen=True)
+class _BlockReported:
+    """A worker called report_blocked; the loop decides what the reason does."""
+
+    agent_id: str
+    blocker: str
+
+
 def _hook_failure_blocker(value: object) -> str | None:
     """The blocker for a turn whose last tool calls failed in a hook, or None.
 
@@ -740,6 +748,8 @@ class VNextScheduler:
                 self._handle_turn_finished(event)
             elif isinstance(event, _UnsolicitedTurnEnded):
                 self._handle_unsolicited_turn_ended(event)
+            elif isinstance(event, _BlockReported):
+                self._handle_block_reported(event)
             elif event == "cancel":
                 continue
             elif event == "reconnect":
@@ -2316,6 +2326,14 @@ class VNextScheduler:
                 },
                 required=["outcome", "verified", "evidence"],
             ),
+            function_tool(
+                "report_blocked",
+                "Use this when you cannot go on without something only your manager or user can give, "
+                "such as a token, an access or a decision. You stay alive with your context, and your "
+                "manager is told the reason and answers you with a message.",
+                properties={"reason": {"type": "string", "minLength": 1}},
+                required=["reason"],
+            ),
         ]
 
     def _session(self):
@@ -3575,15 +3593,25 @@ class VNextScheduler:
             unfinished = [child_id for child_id in agent.child_ids
                           if self._session().agents[child_id].status not in TERMINAL_STATUSES]
             unread = self._unread_message_count(agent)
+            children_blocker = None
             if unfinished:
                 named = list(unfinished[:3])
                 if len(unfinished) > len(named):
                     named.append(f"and {len(unfinished) - len(named)} more")
                 child_label = "child" if len(unfinished) == 1 else "children"
-                blocker = (
+                children_blocker = (
                     f"native task ended with {len(unfinished)} unfinished "
                     f"{child_label}: {', '.join(named)}"
                 )
+            if deferred_blocker is not None and agent.agent_id != self.root.agent_id:
+                # The worker asked for its manager during this turn.  Ending
+                # the task normally does not answer that, so completing it
+                # here would drop the reason and refuse the manager's reply.
+                self._block_with_evidence(agent, "; ".join(
+                    part for part in (deferred_blocker, children_blocker) if part
+                ))
+            elif children_blocker is not None:
+                blocker = children_blocker
                 if unread > 0:
                     blocker += f", and {unread} unread message(s)"
                 self._block_with_evidence(agent, blocker)
@@ -3669,7 +3697,37 @@ class VNextScheduler:
             return
         if agent.status is not AgentStatus.READY:
             return
-        self._block_with_evidence(agent, blocker)
+        self._block_unless_cancelled(agent, blocker)
+
+    def _handle_block_reported(self, event: _BlockReported) -> None:
+        agent = self._session().agents.get(event.agent_id)
+        if agent is None or agent.agent_id == self.root.agent_id:
+            return
+        with self._lock:
+            active = event.agent_id in self._active_turns
+        if active or agent.status is AgentStatus.RUNNING:
+            # The turn's end applies it.  A second report in the same turn
+            # adds its reason to the first.
+            earlier = self._deferred_blockers.get(event.agent_id)
+            blocker = event.blocker
+            if earlier is not None:
+                blocker = earlier if blocker in earlier else f"{earlier}; {blocker}"
+            self._deferred_blockers[event.agent_id] = blocker
+            return
+        if agent.status is not AgentStatus.READY:
+            return
+        # The turn ended before the loop saw the report, so nothing else
+        # will apply it: block now so the parent is woken with the reason.
+        self._block_unless_cancelled(agent, event.blocker)
+
+    def _block_unless_cancelled(self, agent: AgentRecord, blocker: str) -> None:
+        try:
+            self._block_with_evidence(agent, blocker)
+        except ProtocolError:
+            # A cancel from the handler thread can land after the READY check.
+            current = self._session().agents.get(agent.agent_id)
+            if current is None or current.status not in TERMINAL_STATUSES:
+                raise
 
     def _manager_handler(
         self,
@@ -4308,6 +4366,33 @@ class VNextScheduler:
                 {"role": agent.role.value, "status": "completed", "turn_id": turn_id},
             )
             return _dynamic_result(True, {"status": "completed", **({"workspace": workspace} if workspace else {})})
+        if tool == "report_blocked":
+            if agent.role is AgentRole.ROOT_MANAGER:
+                raise ProtocolError(
+                    "primary-reports-to-user",
+                    "the primary has no manager to wake: ask your user directly",
+                )
+            reason = str(arguments.get("reason") or "").strip()
+            if not reason:
+                raise ValueError("reason is required")
+            # The status stays RUNNING until the turn ends.  Blocking here would
+            # release the runtime under a turn that is still answering, so the
+            # reason rides the deferred-blocker path, which the turn's end
+            # applies and an interrupt, reconnect or provider retry carries on.
+            # This runs on a handler thread, so the loop records it: the event
+            # is queued before this reply reaches the provider, which puts it
+            # ahead of the turn's own end in the queue.
+            self._events.put(_BlockReported(agent_id, (
+                f"reported by the worker: {reason}. Answer with send_message, "
+                "then retry it, to resume it on the same session"
+            )))
+            return _dynamic_result(True, {
+                "status": "block-recorded",
+                "message": (
+                    "The block is recorded. End your turn now; your manager is told "
+                    "the reason and will answer you with a message in your next turn."
+                ),
+            })
         raise ProtocolError("unknown-tool", f"unknown manager tool: {tool}")
 
     def _hand_over_workspace(self, agent: AgentRecord) -> dict[str, Any]:

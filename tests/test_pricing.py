@@ -14,6 +14,24 @@ def _at(year: int, month: int, day: int, hour: int, minute: int = 0) -> float:
 
 
 class PricingTests(unittest.TestCase):
+    def test_every_codex_model_in_the_default_catalog_has_a_price(self) -> None:
+        from vnext.vnext_mcp_server import DEFAULT_CATALOG
+
+        unpriced = [
+            entry["model"]
+            for entry in DEFAULT_CATALOG
+            if entry["provider"] == "codex"
+            and entry["model"] not in API_PRICES_PER_MILLION
+        ]
+        self.assertEqual([], unpriced)
+
+    def test_gpt_6_1_sol_uses_the_cheaper_cached_rate(self) -> None:
+        self.assertAlmostEqual(
+            2.0 * 0.2 + 0.1 * 0.8 + 10.0 * 0.1,
+            api_equivalent("gpt-6.1-sol", 1_000_000, 800_000, 100_000),
+            places=12,
+        )
+
     def test_deepseek_live_usage_uses_the_off_peak_rates(self) -> None:
         cost = api_equivalent(DEEPSEEK, 43_142, 37_760, 251)
 
