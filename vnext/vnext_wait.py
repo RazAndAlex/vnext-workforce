@@ -18,7 +18,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .vnext_orchestration import SETTLED_STATUSES
+from .vnext_orchestration import (
+    OUTCOME_TEXT_LIMIT, SETTLED_STATUSES, _STOPPED_WITHOUT_A_WORD,
+)
 from .vnext_report import _parse_row, _run_logs
 
 
@@ -94,11 +96,49 @@ class _LogCursor:
             yield {"type": "unreadable.record", "where": "the whole file", "cause": str(exc)}
 
 
+@dataclass
+class _AgentState:
+    status: str
+    stamp: str
+    payload: dict[str, Any]
+    session_id: str
+
+    def print_report(self, agent: str) -> None:
+        print(f"{agent} {self.status} {self.stamp}")
+        result = self.payload.get("result")
+        result = result if isinstance(result, dict) else {}
+        text = str(result.get("outcome") or "").strip()
+        if not text:
+            text = str(self.payload.get("blocker") or "").strip()
+        if not text:
+            text = _STOPPED_WITHOUT_A_WORD.get(self.status, "")
+        cut_mark = (
+            "… (cut; the full text is in "
+            f".vnext/outcomes/{self.session_id}.jsonl)"
+        )
+        if len(text) > OUTCOME_TEXT_LIMIT:
+            text = text[: OUTCOME_TEXT_LIMIT - len(cut_mark)].rstrip() + cut_mark
+        print(text)
+        verified = "yes" if result.get("verified") else "no"
+        evidence = result.get("evidence") or ()
+        print(f"verified: {verified}, evidence: {len(evidence)} item(s)")
+        usage = self.payload.get("usage")
+        if isinstance(usage, dict):
+            tokens = usage.get("cost_tokens")
+            if isinstance(tokens, dict):
+                tokens = tokens.get("total_tokens")
+            parts = [f"{label}: {value}" for label, value in (
+                ("tokens", tokens), ("cost_usd", usage.get("cost_usd"))
+            ) if value is not None]
+            if parts:
+                print(", ".join(parts))
+
+
 def _states(
     workspace: Path, wanted: set[str], warned: set[tuple],
-    states: dict[str, tuple[str, str]], cursors: dict[Path, _LogCursor],
+    states: dict[str, _AgentState], cursors: dict[Path, _LogCursor],
     session: str | None = None,
-) -> dict[str, tuple[str, str]]:
+) -> dict[str, _AgentState]:
     logs = [workspace / ".vnext" / "runs" / f"{session}.jsonl"] if session is not None else (
         _run_logs(workspace / ".vnext"))
     for log in logs:
@@ -118,9 +158,10 @@ def _states(
             status = payload["status"]
             previous = states.get(agent)
             # Later usage snapshots can repeat a stopped status. Keep when it moved.
-            stamp = previous[1] if previous and previous[0] == status else str(
+            stamp = previous.stamp if previous and previous.status == status else str(
                 row.get("timestamp") or "time not recorded")
-            states[agent] = (status, stamp)
+            states[agent] = _AgentState(status, stamp, payload, str(
+                row.get("session_id") or session or log.stem))
     return states
 
 
@@ -143,6 +184,9 @@ def main(
             parser.error(f"--deadline: {exc}")
     except SystemExit as exc:
         return int(exc.code)
+    # Never lose a finished worker's report to a console that lacks one of its characters.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     workspace = args.workspace.resolve()
     if not workspace.is_dir():
         print(f"vnext-wait: workspace is not a folder: {workspace}", file=sys.stderr)
@@ -151,16 +195,17 @@ def main(
     wanted = set(agents)
     seen: set[str] = set()
     warned: set[tuple] = set()
-    states: dict[str, tuple[str, str]] = {}
+    states: dict[str, _AgentState] = {}
     cursors: dict[Path, _LogCursor] = {}
     started = clock()
     while True:
         _states(workspace, wanted, warned, states, cursors, args.session)
         seen.update(states)
-        if all(states.get(agent, ("unknown", ""))[0] in _SETTLED for agent in agents):
-            for agent in agents:
-                status, stamp = states[agent]
-                print(f"{agent} {status} {stamp}")
+        if all(agent in states and states[agent].status in _SETTLED for agent in agents):
+            for index, agent in enumerate(agents):
+                if index:
+                    print()
+                states[agent].print_report(agent)
             return 0
         elapsed = clock() - started
         unseen = wanted - seen
@@ -174,7 +219,7 @@ def main(
             return 2
         if elapsed >= deadline:
             for agent in agents:
-                status = states.get(agent, ("unknown", ""))[0]
+                status = states[agent].status if agent in states else "unknown"
                 if status not in _SETTLED:
                     print(f"{agent} {status} still running after {args.deadline}")
             return 3

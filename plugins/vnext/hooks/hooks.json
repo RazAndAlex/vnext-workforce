@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "mcp__plugin_vnext_vnext__delegate",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv",
+            "args": ["run", "--no-project", "--quiet", "${CLAUDE_PLUGIN_ROOT}/wake.py"],
+            "asyncRewake": true,
+            "timeout": 1920
+          }
+        ]
+      }
+    ]
+  }
+}

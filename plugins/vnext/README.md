@@ -108,6 +108,19 @@ on hosts where Python 3.11 or newer and that SDK run. Command Code workers
 currently use the same pinned Codex CLI as Codex workers, so their default
 route has the same two-platform limit.
 
+## Automatic wake
+
+After a successful delegation, the plugin runs the returned `wake_command` in
+an asynchronous Claude Code hook. When the worker stops, the hook wakes the
+manager with the worker’s own report, verification flag, evidence count and
+available token and cost totals. The manager can act on the notice and use
+`inspect` for the full record. The plugin handles this wait automatically.
+
+If the worker is still running after 30 minutes, the hook wakes the manager to
+check it with `inspect` and supplies the command to keep waiting in the
+background. Wait errors also wake the manager with their diagnostic. The hook
+needs `uv` on PATH, just like the plugin's server launcher.
+
 ## What it writes
 
 - The workforce writes in `${CLAUDE_PROJECT_DIR}`, under the workers' own

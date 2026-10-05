@@ -37,11 +37,11 @@ class VNextWaitTests(unittest.TestCase):
         self.log.parent.mkdir(parents=True)
         self.clock = Clock()
 
-    def append(self, agent, status, timestamp="2026-10-05T17:00:00+00:00"):
+    def append(self, agent, status, timestamp="2026-10-05T17:00:00+00:00", **payload):
         with self.log.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({
                 "type": "agent.upsert", "session_id": "session", "agent_id": agent,
-                "timestamp": timestamp, "payload": {"status": status},
+                "timestamp": timestamp, "payload": {"status": status, **payload},
             }) + "\n")
 
     def run_wait(self, *options, real_clock=False):
@@ -60,6 +60,56 @@ class VNextWaitTests(unittest.TestCase):
         self.assertIn("worker completed 2026-10-05T17:00:00+00:00", out)
         self.assertEqual("", err)
         self.assertEqual(0, self.clock.now)
+
+    def test_report_contains_latest_outcome_verification_evidence_and_usage(self):
+        self.append("worker", "completed", result={"outcome": "Old report"})
+        self.append("worker", "completed", "2026-10-05T17:01:00+00:00",
+                    result={"outcome": "Fixed the issue.\nTests passed.",
+                            "verified": True, "evidence": ["test run", "diff"]},
+                    usage={"cost_tokens": {"total_tokens": 1234, "input_tokens": 1000,
+                                           "output_tokens": 234}, "cost_usd": 0.25})
+        code, out, err = self.run_wait("--agent", "worker")
+        self.assertEqual(0, code)
+        self.assertEqual("", err)
+        self.assertEqual(
+            "worker completed 2026-10-05T17:00:00+00:00\n"
+            "Fixed the issue.\nTests passed.\n"
+            "verified: yes, evidence: 2 item(s)\n"
+            "tokens: 1234, cost_usd: 0.25\n", out)
+
+    def test_blocker_is_used_when_outcome_is_blank(self):
+        self.append("worker", "blocked", result={"outcome": "  "}, blocker="Need a decision.")
+        code, out, _ = self.run_wait("--agent", "worker")
+        self.assertEqual(0, code)
+        self.assertIn("\nNeed a decision.\nverified: no, evidence: 0 item(s)\n", out)
+
+    def test_missing_report_uses_each_status_fallback(self):
+        from vnext.vnext_orchestration import _STOPPED_WITHOUT_A_WORD
+
+        for status, fallback in _STOPPED_WITHOUT_A_WORD.items():
+            with self.subTest(status=status):
+                self.append("worker", status.value)
+                code, out, _ = self.run_wait("--agent", "worker")
+                self.assertEqual(0, code)
+                self.assertIn("\n" + fallback + "\nverified: no, evidence: 0 item(s)\n", out)
+
+    def test_long_outcome_is_bounded_and_names_its_session_outcome_log(self):
+        from vnext.vnext_orchestration import OUTCOME_TEXT_LIMIT
+
+        self.append("worker", "completed", result={"outcome": "x" * (OUTCOME_TEXT_LIMIT + 1)})
+        code, out, _ = self.run_wait("--agent", "worker")
+        self.assertEqual(0, code)
+        report = out.splitlines()[1]
+        self.assertEqual(OUTCOME_TEXT_LIMIT, len(report))
+        self.assertTrue(report.endswith("… (cut; the full text is in .vnext/outcomes/session.jsonl)"))
+
+    def test_reports_are_separated_and_only_available_usage_is_printed(self):
+        self.append("one", "completed", result={"outcome": "First"}, usage={"cost_tokens": 0})
+        self.append("two", "failed", blocker="Second", usage={"cost_usd": 0})
+        code, out, _ = self.run_wait("--agent", "one", "--agent", "two")
+        self.assertEqual(0, code)
+        self.assertIn("tokens: 0\n\ntwo failed", out)
+        self.assertTrue(out.endswith("cost_usd: 0\n"))
 
     def test_running_agent_completes_after_a_thread_appends_its_row(self):
         self.append("worker", "running")
@@ -345,11 +395,13 @@ class VNextWaitTests(unittest.TestCase):
         service.session = SimpleNamespace(external_tool_call=Mock(return_value=original))
         with patch("vnext.vnext_mcp_server.sys.executable", "/Python Install/bin/python"):
             reply = service._dispatch("delegate", {"workspace": "worktree"}, {})
-        command = shlex.split(reply.value["wake_command"])
-        self.assertEqual([
+        command = [
             "/Python Install/bin/python", "-m", "vnext.vnext_wait",
             "--workspace", str(service.workspace.resolve()), "--agent", "child-123",
-            "--session", service._session_id, "--deadline", "30m"], command)
+            "--session", service._session_id, "--deadline", "30m"]
+        # shlex.split drops Windows backslashes, so compare the quoted string.
+        quote = subprocess.list2cmdline if os.name == "nt" else shlex.join
+        self.assertEqual(quote(command), reply.value["wake_command"])
         service._record(SimpleNamespace(type="agent.upsert", agent_id="child-123",
                                         payload={"agent_id": "child-123", "status": "completed"}))
         named_log = Path(command[command.index("--workspace") + 1]) / ".vnext" / "runs" / (

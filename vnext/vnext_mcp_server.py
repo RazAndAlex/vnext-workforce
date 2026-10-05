@@ -242,8 +242,9 @@ def _external_tools(
             entry["description"] = replacement
         if name == "delegate":
             entry["description"] = str(entry.get("description", "")) + (
-                " A client that cannot be woken by vNext can run the returned "
-                "wake_command in the background to wake when the child stops or its deadline passes."
+                " Claude Code with the vNext plugin wakes the manager automatically when the child stops."
+                " Other clients can run the returned wake_command in the background "
+                "to be woken when the child stops or its deadline passes."
             )
         # Both tools that choose a model carry the roster.
         if roster and name in {"delegate", "replace"}:
