@@ -1165,12 +1165,23 @@ class VNextAppServerAdapter:
             and cached.get("provider") == self.provider
             and cached.get("provider_session") == runtime_thread
         ):
+            phase = str(cached.get("binding_phase") or "started")
+            # This adapter started or resumed the thread itself and took its
+            # id from the provider's own reply, which is the same fact the
+            # `thread/read` below attests.  Reporting it as "started" left
+            # every vNext-started Codex worker unroutable: the scheduler routes
+            # approvals only to attested identities, so each escalation waited
+            # out the grace window and was declined as unrouted.  Phases this
+            # adapter did not create itself, such as an observed native child,
+            # pass through unchanged.
+            if phase in {"started", "resumed"}:
+                phase = "attested"
             result = {
                 "runtime_thread": runtime_thread,
                 "provider": self.provider,
                 "bound": True,
                 "provider_session": runtime_thread,
-                "binding_phase": str(cached.get("binding_phase") or "started"),
+                "binding_phase": phase,
                 "synthetic": False,
             }
             # A provider-created child is a real persisted Codex thread.  Its

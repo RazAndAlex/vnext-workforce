@@ -407,3 +407,5 @@ class AutomaticClaudeServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+AutomaticClaudeServiceTests.test_no_instruction_child_reaches_adapter_scheduler_and_scoped_tool_handler = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(AutomaticClaudeServiceTests.test_no_instruction_child_reaches_adapter_scheduler_and_scoped_tool_handler)

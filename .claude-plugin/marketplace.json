@@ -3,7 +3,7 @@
   "owner": {
     "name": "RazAndAlex"
   },
-  "description": "An MCP server that lets Claude Code delegate work to Claude, Codex, Z.ai and Command Code workers, and keeps the record",
+  "description": "An MCP server that lets Claude Code delegate work to Codex, Z.ai and Command Code workers, and keeps the record",
   "plugins": [
     {
       "name": "vnext",

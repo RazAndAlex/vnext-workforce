@@ -37,7 +37,11 @@ class VNextPluginWakeTests(unittest.TestCase):
         self.assertEqual(set(configuration["hooks"]), {"PostToolUse"})
         entries = configuration["hooks"]["PostToolUse"]
         self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["matcher"], "mcp__plugin_vnext_vnext__delegate")
+        matcher = entries[0]["matcher"]
+        for tool in ("delegate", "retry", "replace", "send_message"):
+            self.assertRegex(f"mcp__plugin_vnext_vnext__{tool}", f"^(?:{matcher})$")
+        for tool in ("steer", "inspect", "cancel_agent"):
+            self.assertNotRegex(f"mcp__plugin_vnext_vnext__{tool}", f"^(?:{matcher})$")
         hooks = entries[0]["hooks"]
         self.assertEqual(len(hooks), 1)
         hook = hooks[0]

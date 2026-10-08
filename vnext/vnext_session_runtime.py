@@ -34,6 +34,20 @@ from .vnext_scheduler import SchedulerCancelled, SchedulerError, SchedulerHooks,
 from .workforce_contracts import RunCancellation
 
 
+# The private runtime keeps subscription workers; the public exporter flips
+# this one build switch. Z.ai still uses the Claude SDK with its own API key.
+CLAUDE_SUBSCRIPTION_WORKERS = False
+CLAUDE_WORKERS_UNAVAILABLE = (
+    "Claude workers are not part of the public vNext build. "
+    "Use Claude Code's own subagents for Claude work."
+)
+
+
+def require_worker_provider(provider: str) -> None:
+    if provider == "claude" and not CLAUDE_SUBSCRIPTION_WORKERS:
+        raise ValueError(CLAUDE_WORKERS_UNAVAILABLE)
+
+
 PROVIDERS = {
     "codex": ("app-server", "user-codex-home"),
     "claude": ("claude-agent-sdk", "subscription"),
@@ -114,6 +128,7 @@ def session_registry(request: SessionStartRequest) -> ModelRegistry:
         provider = entry.get("provider")
         if not isinstance(model, str) or not model.strip() or provider not in PROVIDERS:
             raise ValueError("model catalog entries require a model and supported provider")
+        require_worker_provider(provider)
         harness, credential = PROVIDERS[provider]
         if entry.get("harness", harness) != harness:
             raise ValueError(f"unsupported harness for {provider}")
@@ -187,6 +202,33 @@ class _RootStartupAdapter:
         except Exception:
             self._failed()
             raise
+
+
+CLAUDE_SDK_ROUTES = frozenset({"claude", "zai"})
+
+
+def claude_route_adapter(provider: str, workspace: str | Path, config: Mapping[str, Any]) -> Any:
+    """Build the Claude SDK adapter a worker on ``provider`` gets.
+
+    The session runtime and the standalone smoke route both call this, so the
+    two cannot drift apart on permission mode, tool inputs or side runtime.
+    """
+    require_worker_provider(provider)
+    if provider not in CLAUDE_SDK_ROUTES:
+        raise ValueError(f"no runtime factory for {provider}")
+    from .vnext_claude import ClaudeCodeAdapter, side_runtime_bridge_command
+    side = config.get("claude_runtime")
+    bridge_command = None
+    if side:
+        # A side runtime from --update-runtimes: the bridge runs
+        # on that venv's Python, so it imports that SDK.
+        from .vnext_runtimes import verify_claude_runtime
+        verify_claude_runtime(side)
+        bridge_command = side_runtime_bridge_command(side)
+    return ClaudeCodeAdapter(workspace=str(workspace), provider=provider,
+        bridge_command=bridge_command,
+        permission_mode=str(config.get("claude_permission_mode", "default")),
+        tool_inputs=config.get("claude_tool_inputs") is True)
 
 
 class VNextRuntimeSession:
@@ -639,6 +681,7 @@ class VNextRuntimeSession:
     def _adapter(self, agent: AgentRecord) -> Any:
         card = self.registry.cards[agent.model_id]
         provider = str(card.provider)
+        require_worker_provider(provider)
         with self._adapter_lock:
             existing = self._adapters.get(provider)
             if existing is not None:
@@ -649,20 +692,8 @@ class VNextRuntimeSession:
                 adapter = self._codex_adapter(agent)
             elif provider == "commandcode":
                 adapter = self._commandcode_adapter(agent)
-            elif provider in {"claude", "zai"}:
-                from .vnext_claude import ClaudeCodeAdapter, side_runtime_bridge_command
-                side = self.request.config.get("claude_runtime")
-                bridge_command = None
-                if side:
-                    # A side runtime from --update-runtimes: the bridge runs
-                    # on that venv's Python, so it imports that SDK.
-                    from .vnext_runtimes import verify_claude_runtime
-                    verify_claude_runtime(side)
-                    bridge_command = side_runtime_bridge_command(side)
-                adapter = ClaudeCodeAdapter(workspace=str(self.workspace), provider=provider,
-                    bridge_command=bridge_command,
-                    permission_mode=str(self.request.config.get("claude_permission_mode", "default")),
-                    tool_inputs=self.request.config.get("claude_tool_inputs") is True)
+            elif provider in CLAUDE_SDK_ROUTES:
+                adapter = claude_route_adapter(provider, self.workspace, self.request.config)
             elif provider == "external":
                 from .vnext_external_primary import ExternalPrimaryAdapter
                 adapter = ExternalPrimaryAdapter(

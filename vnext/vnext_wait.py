@@ -14,7 +14,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,12 @@ from .vnext_report import _parse_row, _run_logs
 
 
 _SETTLED = frozenset(status.value for status in SETTLED_STATUSES)
+
+# A worker that ends its turn by messaging its parent stays "ready" in the run
+# log.  That is a stop only if the turn really ended and no new one begins, so
+# the waiter holds the condition this long.  A queued message that starts the
+# next turn at once then never causes a wake.
+READY_GRACE_SECONDS = 5.0
 
 
 def _positive(value: str) -> float:
@@ -51,6 +57,12 @@ def _agent(value: str) -> str:
     if not value.strip():
         raise argparse.ArgumentTypeError("agent ID must not be empty")
     return value
+
+
+def _offset(value: str) -> int:
+    if not value.isdigit():
+        raise argparse.ArgumentTypeError("must be a whole number of bytes")
+    return int(value)
 
 
 def _session(value: str) -> str:
@@ -103,15 +115,27 @@ class _AgentState:
     payload: dict[str, Any]
     session_id: str
 
-    def print_report(self, agent: str) -> None:
-        print(f"{agent} {self.status} {self.stamp}")
+    def print_report(self, agent: str, trail: "_Trail | None" = None) -> None:
         result = self.payload.get("result")
         result = result if isinstance(result, dict) else {}
-        text = str(result.get("outcome") or "").strip()
-        if not text:
-            text = str(self.payload.get("blocker") or "").strip()
-        if not text:
-            text = _STOPPED_WITHOUT_A_WORD.get(self.status, "")
+        if self.status == "ready":
+            # Reached only through the ended-turn rule: no final report exists.
+            when = trail.last_turn.get(agent, ("", self.stamp))[1] if trail else self.stamp
+            print(f"{agent} ready {when}")
+            text = ("This worker ended its turn without a final report and is waiting "
+                    "for a message.")
+            message = (trail.last_message.get(agent, "") if trail else "").strip()
+            if message:
+                text += f" Its latest message to its parent: {message}"
+            else:
+                text += " It sent no message to its parent that this log holds."
+        else:
+            print(f"{agent} {self.status} {self.stamp}")
+            text = str(result.get("outcome") or "").strip()
+            if not text:
+                text = str(self.payload.get("blocker") or "").strip()
+            if not text:
+                text = _STOPPED_WITHOUT_A_WORD.get(self.status, "")
         cut_mark = (
             "… (cut; the full text is in "
             f".vnext/outcomes/{self.session_id}.jsonl)"
@@ -134,11 +158,30 @@ class _AgentState:
                 print(", ".join(parts))
 
 
+@dataclass
+class _Trail:
+    """What the rows read so far say about each agent's turns and messages."""
+
+    turn_started: set[str] = field(default_factory=set)
+    last_turn: dict[str, tuple[str, str]] = field(default_factory=dict)
+    last_message: dict[str, str] = field(default_factory=dict)
+    ready_since: dict[str, float] = field(default_factory=dict)
+
+    def turn_ended(self, agent: str, states: dict[str, "_AgentState"]) -> bool:
+        state = states.get(agent)
+        return (
+            state is not None and state.status == "ready"
+            and agent in self.turn_started
+            and self.last_turn.get(agent, ("", ""))[0] == "turn.completed"
+        )
+
+
 def _states(
     workspace: Path, wanted: set[str], warned: set[tuple],
     states: dict[str, _AgentState], cursors: dict[Path, _LogCursor],
-    session: str | None = None,
+    session: str | None = None, trail: _Trail | None = None,
 ) -> dict[str, _AgentState]:
+    trail = trail if trail is not None else _Trail()
     logs = [workspace / ".vnext" / "runs" / f"{session}.jsonl"] if session is not None else (
         _run_logs(workspace / ".vnext"))
     for log in logs:
@@ -151,6 +194,19 @@ def _states(
                 continue
             agent = row.get("agent_id")
             payload = row.get("payload")
+            kind = row.get("type")
+            if kind in {"turn.started", "turn.completed"} and agent in wanted:
+                if kind == "turn.started":
+                    trail.turn_started.add(agent)
+                trail.last_turn[agent] = (kind, str(row.get("timestamp") or "time not recorded"))
+                continue
+            if (
+                kind == "command.acknowledged" and isinstance(payload, dict)
+                and payload.get("command") == "send_message"
+                and payload.get("sender_id") in wanted
+            ):
+                trail.last_message[payload["sender_id"]] = str(payload.get("message") or "")
+                continue
             if row.get("type") != "agent.upsert" or not isinstance(agent, str) or agent not in wanted:
                 continue
             if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
@@ -174,6 +230,11 @@ def main(
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--agent", action="append", type=_agent, required=True)
     parser.add_argument("--session", type=_session, metavar="SESSION_ID")
+    parser.add_argument(
+        "--since-offset", type=_offset, default=0, metavar="BYTES",
+        help="with --session, ignore run-log bytes before this offset (a retried "
+             "agent's earlier settled row)",
+    )
     parser.add_argument("--deadline", default="30m", metavar="DURATION")
     parser.add_argument("--poll", type=_positive, default=2.0, metavar="SECONDS")
     try:
@@ -196,16 +257,35 @@ def main(
     seen: set[str] = set()
     warned: set[tuple] = set()
     states: dict[str, _AgentState] = {}
+    trail = _Trail()
     cursors: dict[Path, _LogCursor] = {}
+    if args.since_offset and args.session is not None:
+        cursors[workspace / ".vnext" / "runs" / f"{args.session}.jsonl"] = _LogCursor(
+            offset=args.since_offset)
     started = clock()
     while True:
-        _states(workspace, wanted, warned, states, cursors, args.session)
+        _states(workspace, wanted, warned, states, cursors, args.session, trail)
         seen.update(states)
-        if all(agent in states and states[agent].status in _SETTLED for agent in agents):
+        now = clock()
+        for agent in agents:
+            if trail.turn_ended(agent, states):
+                trail.ready_since.setdefault(agent, now)
+            else:
+                trail.ready_since.pop(agent, None)
+
+        def stopped(agent: str) -> bool:
+            if agent not in states:
+                return False
+            if states[agent].status in _SETTLED:
+                return True
+            since = trail.ready_since.get(agent)
+            return since is not None and now - since >= READY_GRACE_SECONDS
+
+        if all(stopped(agent) for agent in agents):
             for index, agent in enumerate(agents):
                 if index:
                     print()
-                states[agent].print_report(agent)
+                states[agent].print_report(agent, trail)
             return 0
         elapsed = clock() - started
         unseen = wanted - seen
@@ -220,13 +300,17 @@ def main(
         if elapsed >= deadline:
             for agent in agents:
                 status = states[agent].status if agent in states else "unknown"
-                if status not in _SETTLED:
+                if not stopped(agent):
                     print(f"{agent} {status} still running after {args.deadline}")
             return 3
         remaining = deadline - elapsed
         if unseen:
             remaining = min(remaining, 60.0 - elapsed)
-        sleep(min(args.poll, remaining))
+        pause = min(args.poll, remaining)
+        # Wake as soon as the grace ends instead of up to a poll later.
+        for since in trail.ready_since.values():
+            pause = min(pause, max(since + READY_GRACE_SECONDS - clock(), 0.01))
+        sleep(pause)
 
 
 if __name__ == "__main__":

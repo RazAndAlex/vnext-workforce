@@ -43,11 +43,20 @@ def _expected_sdk_version() -> str:
     return os.environ.get(_SDK_VERSION_ENV) or CLAUDE_SDK_VERSION
 _VERSION = 1
 _MAX_JSONL = 65_536
+# A tool result that carries an image arrives from the CLI as one base64 JSON
+# message, and the SDK refuses any message over its default 1 MiB buffer.
+# Anthropic accepts requests up to 32 MB, so one message can approach that size.
+# The bridge drops tool result content before its own stdout (_MAX_JSONL).
+_SDK_MAX_BUFFER_SIZE = 64 * 1024 * 1024
 # Opted-in tool arguments above this size travel as a preview, so one event
 # stays well inside _MAX_JSONL after escaping and the event envelope.
 _TOOL_INPUT_MAX_CHARS = 32_000
 _TOOL_INPUT_PREVIEW_CHARS = 8_000
 _MAX_PENDING_EFFECTS = 64
+# CLI status/init notifications are not assistant messages or effects. Keep
+# their own bounded budget so a startup burst cannot exhaust the 64 slots
+# needed by transcript/stream events before assistant/result identity binds.
+_MAX_PENDING_SYSTEM_MESSAGES = 1024
 _MAX_METADATA_REFRESH_PER_EVENT = 4
 # The resolver keeps at most this many unresolved children, so one settling
 # pass at a parent terminal can cover all of them and still be bounded.
@@ -2614,6 +2623,8 @@ class _Bridge:
             # itself (_run_query).
             **({"extra_args": {_REPLAY_FLAG: None}}
                if "extra_args" in getattr(self._sdk.ClaudeAgentOptions, "__dataclass_fields__", {}) else {}),
+            **({"max_buffer_size": _SDK_MAX_BUFFER_SIZE}
+               if "max_buffer_size" in getattr(self._sdk.ClaudeAgentOptions, "__dataclass_fields__", {}) else {}),
             # These are provider observations, not an assertion that every
             # native child can already be adopted.  They give the bridge the
             # task IDs/parent links needed to decide that from evidence.
@@ -3745,14 +3756,24 @@ class _Bridge:
             pending = state["pending_messages"] = []
         if not isinstance(pending, list):
             raise BridgeError("Claude reservation lacks bounded pending message state")
-        if len(pending) >= _MAX_PENDING_EFFECTS:
+        system_count = sum(_event_name(held) == "system_message" for held in pending)
+        if _event_name(event) == "system_message":
+            if system_count >= _MAX_PENDING_SYSTEM_MESSAGES:
+                raise BridgeError(
+                    "Claude pending system message capacity exceeded before identity binding; "
+                    f"arriving system_message, held {_held_census(pending)}"
+                )
+            pending.append(dict(event))
+            return
+        if len(pending) - system_count >= _MAX_PENDING_EFFECTS:
             # A stream delta is incremental display text.  A reasoning model at
             # high effort emits hundreds of them before the first frame that
             # carries a native session id, and ending the reservation over
             # display text loses the whole run.  Discard the oldest delta and
-            # count it.  Every other held event is a whole message, and a
-            # buffer full of those is a real protocol defect.
-            if event.get("name") != "stream" or not self._drop_oldest_stream_delta(state, pending):
+            # count it: a whole message is worth more than a held delta.
+            # System notifications have a separate budget above. A buffer
+            # full of other whole messages is still a protocol defect.
+            if not self._drop_oldest_stream_delta(state, pending):
                 raise BridgeError(
                     "Claude pending message capacity exceeded before identity binding; "
                     f"arriving {_event_name(event)}, held {_held_census(pending)}"

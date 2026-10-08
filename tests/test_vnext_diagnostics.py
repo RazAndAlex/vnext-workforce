@@ -84,6 +84,9 @@ def tearDownModule() -> None:
 
 class ClassifyMessageTests(unittest.TestCase):
     CASES = {
+        "Claude pending system message capacity exceeded before identity binding; ": (
+            FailureCategory.EFFECT_STATE_EXHAUSTED
+        ),
         "workspace is unavailable": FailureCategory.WORKSPACE_UNAVAILABLE,
         "workspace does not exist": FailureCategory.WORKSPACE_UNAVAILABLE,
         "workspace is not a folder": FailureCategory.WORKSPACE_UNAVAILABLE,
@@ -439,7 +442,7 @@ class SourceCoverageTests(unittest.TestCase):
     # UPDATE THESE NUMBERS DELIBERATELY when you add or remove a raise site.
     # Having to edit the number is the point: it is the moment you confirm the
     # new literal is classified rather than merely tolerated.
-    EXPECTED_LITERALS = {"vnext_claude.py": 121, "vnext_claude_bridge.py": 139}
+    EXPECTED_LITERALS = {"vnext_claude.py": 121, "vnext_claude_bridge.py": 140}
 
     # Raise sites whose message genuinely cannot be read from the source, each
     # with the reason it is acceptable.  Keyed by (module, raiser, expression)

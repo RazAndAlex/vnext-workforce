@@ -56,6 +56,8 @@ from .vnext_worker_tools import (
 )
 
 
+DEFAULT_TURN_TIMEOUT = 1800
+
 MANAGER_EFFORT = "high"
 WORKER_EFFORT = "high"
 # How many queued messages one prompt may carry.  The rest stay undelivered and
@@ -552,7 +554,7 @@ class VNextScheduler:
         # sibling on the same work hit the old 600s bound, so the bound was
         # cutting off turns that were still making progress.  The branch
         # approval wait below stays at its own 240s ceiling.
-        turn_timeout: float = 1800,
+        turn_timeout: float = DEFAULT_TURN_TIMEOUT,
         # Injected so a test can pin the wall clock the worker reads.
         now: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
@@ -1565,10 +1567,9 @@ class VNextScheduler:
         approval_id = f"approval-{uuid.uuid4()}"
         worker_id = self._approval_worker(params, provider)
         if worker_id is None:
-            response = {
-                "decision": "decline",
-                "reason": _BOUNDARY_DECLINE_REASONS["unrouted"],
-            }
+            reason = _BOUNDARY_DECLINE_REASONS["unrouted"]
+            self._record_boundary_decline(None, approval_id, params, reason)
+            response = {"decision": "decline", "reason": reason}
             return self._finish_approval(
                 method,
                 self._unattested_approval(params),
@@ -1881,7 +1882,7 @@ class VNextScheduler:
 
     def _record_boundary_decline(
         self,
-        worker_id: str,
+        worker_id: str | None,
         approval_id: str,
         params: Mapping[str, Any],
         reason: str,
@@ -1893,10 +1894,44 @@ class VNextScheduler:
         attempt survived only as prose inside the worker's own text.  The pair
         below names this boundary as the resolver, which is what tells an
         operator it apart from a manager's refusal.
+
+        A request routed to no worker (`worker_id` None) is recorded against
+        the session root, the one agent always present, and names no worker.
+        Eleven such declines in one day once left no event at all: every
+        escalation of a granted Codex worker was refused and nothing showed it.
         """
 
         session = self._session()
-        worker = session.agents.get(worker_id)
+        if worker_id is None:
+            worker = session.agents.get(self.root.agent_id)
+            routed: dict[str, Any] = {}
+            provider = params.get("provider")
+            if isinstance(provider, str) and provider:
+                routed["provider"] = provider
+            # Only an attested correlation names a provider session; a local
+            # reservation is recorded as what it is.
+            correlation = params.get("provider_correlation")
+            handle = params.get("routing_handle")
+            if params.get("correlation_attested") is True and isinstance(
+                correlation, Mapping
+            ):
+                unrouted = ("provider_session", correlation.get("session"))
+            elif isinstance(handle, Mapping):
+                unrouted = ("routing_reservation", handle.get("reservation_id"))
+            else:
+                unrouted = ("", None)
+            if isinstance(unrouted[1], str) and unrouted[1]:
+                routed[unrouted[0]] = unrouted[1]
+        else:
+            worker = session.agents.get(worker_id)
+            routed = {} if worker is None else {
+                "worker_agent": worker.agent_id,
+                **(
+                    {"manager_agent": worker.parent_agent_id}
+                    if isinstance(worker.parent_agent_id, str)
+                    else {}
+                ),
+            }
         if worker is None:
             return
         tool_label, command = self._approval_subject(params)
@@ -1907,12 +1942,7 @@ class VNextScheduler:
             worker,
             {
                 "approval_id": approval_id,
-                "worker_agent": worker.agent_id,
-                **(
-                    {"manager_agent": worker.parent_agent_id}
-                    if isinstance(worker.parent_agent_id, str)
-                    else {}
-                ),
+                **routed,
                 "tool": tool_label,
                 "effect": effect if isinstance(effect, str) and effect else "unnamed",
                 **subject_field,
@@ -3871,6 +3901,49 @@ class VNextScheduler:
             turn = self._active_turns.get(agent_id)
         return turn.control_turn_id if turn is not None else None
 
+    def _delegate_preflight_warnings(self, arguments: Mapping[str, Any]) -> list[str]:
+        """Offer route/turn limits without changing whether delegation succeeds."""
+        objective = str(arguments.get("objective", ""))
+        card = self.managed.control.registry.cards.get(str(arguments.get("model_id", "")))
+        provider = card.provider if card is not None else None
+        warnings = []
+        # Only the Claude SDK routes cut a turn at a fixed wall-clock deadline.
+        # The app-server routes (codex, commandcode) renew the same budget on
+        # every turn event, so a long but active turn is not cut there.
+        if provider in {"claude", "zai"}:
+            # "1h30" and "1h30m" are one 90-minute budget. A capital M is a
+            # count ("100M rows"), so the bare minute unit is lowercase only.
+            budgets = re.finditer(
+                r"(?<![\w.])(\d+(?:\.\d+)?)\s*(?:(?i:hours?|hrs?|h)(?:(\d+)(?:(?i:minutes?|mins?)|m)?)?"
+                r"|((?i:minutes?|mins?)|m))(?!\w)",
+                objective,
+            )
+            minutes = []
+            for match in budgets:
+                if match[3] is not None:
+                    minutes.append(float(match[1]))
+                else:
+                    minutes.append(float(match[1]) * 60 + float(match[2] or 0))
+            if any(value * 60 > self.turn_timeout for value in minutes):
+                warnings.append(
+                    f"The objective states a time budget above the {self.turn_timeout:g} s"
+                    f" ({self.turn_timeout / 60:g} min) wall-clock cap a {provider} route puts on one turn;"
+                    " split longer work across turns or children."
+                )
+        if re.search(
+            r"\b(browser|playwright|chrome|chromium|chromedriver|puppeteer)\b"
+            r"|\bbrowse\s+the\s+web\b"
+            r"|\bscreenshot\s+of\s+(?:the\s+)?(?:page|site)\b",
+            objective, re.IGNORECASE,
+        ):
+            route = f" ({provider} route)" if provider else ""
+            warnings.append(
+                f"vNext provides no browser of its own{route}; a worker has one only if the user's own"
+                " config (Claude settings or ~/.codex) enables a browser MCP server,"
+                " and Codex workers run with network restricted."
+            )
+        return warnings
+
     def _apply_manager_tool(
         self,
         agent_id: str,
@@ -3879,6 +3952,19 @@ class VNextScheduler:
     ) -> dict[str, Any]:
         session = self._session()
         agent = session.agents[agent_id]
+        # Check before validation or mutation, including aliases that are no
+        # longer advertised by the public catalog and stored retry targets.
+        from .vnext_session_runtime import CLAUDE_SUBSCRIPTION_WORKERS, require_worker_provider
+        if not CLAUDE_SUBSCRIPTION_WORKERS and tool in {"delegate", "replace", "retry", "send_message"}:
+            model_id = str(arguments.get("model_id") or "")
+            if tool in {"retry", "send_message"}:
+                target = session.agents.get(str(arguments.get("agent_id") or ""))
+                model_id = target.model_id if target is not None else ""
+            card = self.managed.control.registry.cards.get(model_id)
+            provider = card.provider if card is not None else (
+                "claude" if model_id in {"sonnet", "opus", "fable"} else ""
+            )
+            require_worker_provider(provider)
         self._note_manager_tool(agent_id, tool)
         # Tool schemas are the public contract for every manager entry path.
         # Refuse undeclared top-level keys before any handler changes the tree.
@@ -3908,6 +3994,12 @@ class VNextScheduler:
                 # evidence request must not leave behind a child from a failed
                 # delegate call.
                 evidence_request = validate_required_tool_effect(raw_contract)
+            try:
+                warnings = self._delegate_preflight_warnings(arguments)
+            except Exception:
+                # The warnings are advice; a fault in them must never turn a
+                # valid delegate into a failed one.
+                warnings = []
             child = self.managed.spawn_from_manager(
                 requester_id=agent_id,
                 role=role,
@@ -3920,6 +4012,7 @@ class VNextScheduler:
             return _dynamic_result(
                 True,
                 {
+                    **({"warnings": warnings} if warnings else {}),
                     "agent_id": child.agent_id,
                     "role": child.role.value,
                     "model_id": child.model_id,

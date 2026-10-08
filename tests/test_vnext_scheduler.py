@@ -14,7 +14,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 import suite_environment  # noqa: F401  # the suite settings; unittest never reads conftest.py
-from vnext.vnext_app_server import TurnHandle
+from vnext.vnext_app_server import TurnHandle, VNextAppServerAdapter
 from vnext.vnext_claude import ClaudeRuntimeError
 # The two sides of one approval are tested together on purpose: the bridge
 # names an effect and this reviewer decides on it, and F17 was the gap between
@@ -919,6 +919,63 @@ class VNextSchedulerTests(unittest.TestCase):
             )
         self.assertEqual("invalid-approval-mode", refused.exception.code)
 
+    def _delegate_for_preflight(self, objective, turn_timeout=1800, provider="claude"):
+        self.control.registry.cards[WORKER] = ModelCard(
+            WORKER, frozenset({AgentRole.WORKER}), provider=provider
+        )
+        scheduler = VNextScheduler(
+            managed=self.managed, root=self.root,
+            cancellation=RunCancellation(), turn_timeout=turn_timeout,
+        )
+        result = payload(scheduler._apply_manager_tool(self.root.agent_id, "delegate", {
+            "role": AgentRole.WORKER.value, "model_id": WORKER, "objective": objective,
+        }))
+        self.assertTrue(result["success"], result)
+        self.assertIn(result["agent_id"], self.control.sessions[self.root.session_id].agents)
+        return result
+
+    def test_delegate_warns_when_objective_exceeds_turn_cap(self) -> None:
+        for budget in ("96 minutes", "2 hours", "90 min", "1.5h", "31 mins", "0.6 hr", "1h30", "1h30m", "45m"):
+            with self.subTest(budget=budget):
+                result = self._delegate_for_preflight(f"Spend {budget} investigating")
+                self.assertEqual(1, len(result["warnings"]))
+                self.assertIn("1800", result["warnings"][0])
+                self.assertIn("wall-clock", result["warnings"][0])
+        result = self._delegate_for_preflight("Spend 2 minutes investigating", turn_timeout=60)
+        self.assertIn("60", result["warnings"][0])
+
+    def test_delegate_time_warning_is_route_aware(self) -> None:
+        # Only the Claude SDK routes cut a turn at a wall-clock deadline; the
+        # app-server routes renew the budget on every turn event.
+        for provider, expected in (("claude", 1), ("zai", 1), ("codex", 0), ("commandcode", 0)):
+            with self.subTest(provider=provider):
+                result = self._delegate_for_preflight("Spend 2 hours investigating", provider=provider)
+                self.assertEqual(expected, len(result.get("warnings", [])))
+
+    def test_delegate_does_not_read_counts_as_minutes(self) -> None:
+        for objective in ("process 100M rows", "summarise a 50 M token corpus", "a 64 MB file", "5m of logs"):
+            with self.subTest(objective=objective):
+                self.assertNotIn("warnings", self._delegate_for_preflight(objective))
+
+    def test_delegate_succeeds_when_preflight_warnings_raise(self) -> None:
+        with patch.object(VNextScheduler, "_delegate_preflight_warnings", side_effect=RuntimeError("bug")):
+            result = self._delegate_for_preflight("Spend 2 hours investigating")
+        self.assertNotIn("warnings", result)
+
+    def test_delegate_warns_when_objective_needs_browser(self) -> None:
+        for request in ("browser", "Playwright", "Chrome", "chromium", "puppeteer", "chromedriver",
+                        "browse the web", "screenshot of the page", "screenshot of the site"):
+            with self.subTest(request=request):
+                result = self._delegate_for_preflight(f"Use {request} to inspect the UI")
+                self.assertEqual(1, len(result["warnings"]))
+                self.assertIn("no browser", result["warnings"][0])
+                self.assertIn("network restricted", result["warnings"][0])
+                self.assertIn("user", result["warnings"][0])
+
+    def test_delegate_omits_warnings_for_clean_objective(self) -> None:
+        result = self._delegate_for_preflight("Spend 30 min reviewing a local Python file")
+        self.assertNotIn("warnings", result)
+
     def test_delegate_defaults_to_standing_approval_and_journals_the_decision(self) -> None:
         lifecycle: list[tuple[str, dict]] = []
         scheduler = VNextScheduler(
@@ -1354,9 +1411,14 @@ class VNextSchedulerTests(unittest.TestCase):
             tool_handler=None,
         )
         lifecycle: list[tuple[str, dict]] = []
+        unrouted: list[tuple[str, dict]] = []
         requested = threading.Event()
 
-        def record(event_type, _agent, data):
+        def record(event_type, agent, data):
+            # A decline routed to no worker is recorded on the session root.
+            if agent.agent_id == self.root.agent_id:
+                unrouted.append((event_type, dict(data)))
+                return
             lifecycle.append((event_type, dict(data)))
             if event_type == "approval_requested":
                 requested.set()
@@ -1408,6 +1470,10 @@ class VNextSchedulerTests(unittest.TestCase):
             ),
         )
         self.assertFalse(requested.is_set())
+        self.assertEqual(
+            [("approval_requested", None), ("approval_resolved", "vnext-approval-boundary")],
+            [(event_type, data.get("resolver")) for event_type, data in unrouted],
+        )
         outcome: dict[str, object] = {}
 
         def review() -> None:
@@ -6531,6 +6597,171 @@ class VNextSchedulerTests(unittest.TestCase):
         self.assertEqual("network-read", request.permission)
         self.assertEqual(("https://docs.example.com/api",), request.command)
 
+    def test_a_granted_codex_workers_escalation_is_accepted(self) -> None:
+        """A thread vNext started itself is routed to its worker's grant.
+
+        The Codex adapter caches the identity `thread/start` acknowledged.  It
+        used to report that cache as "started", which the router never
+        accepts, so every escalation of a granted Codex worker waited out the
+        grace window and was declined as unrouted ("rejected by user").
+        """
+
+        lifecycle: list[tuple[str, str, dict]] = []
+        scheduler = VNextScheduler(
+            managed=self.managed,
+            root=self.root,
+            cancellation=RunCancellation(),
+            hooks=SchedulerHooks(
+                lifecycle=lambda kind, agent, data: lifecycle.append(
+                    (kind, agent.agent_id, dict(data))
+                )
+            ),
+        )
+        delegated = payload(
+            scheduler._apply_manager_tool(
+                self.root.agent_id,
+                "delegate",
+                {
+                    "role": AgentRole.WORKER.value,
+                    "model_id": WORKER,
+                    "objective": "Run one command that needs escalation",
+                    "task_contract": {"criteria": ["command ran"]},
+                },
+            )
+        )
+        worker = self.control.sessions[self.root.session_id].agents[
+            delegated["agent_id"]
+        ]
+        self.assertEqual("granted", worker.approvals)
+        codex = object.__new__(VNextAppServerAdapter)
+        codex.provider = "codex"
+        codex._condition = threading.Condition(threading.RLock())
+        codex._native_thread_attestations = {
+            "codex-worker-thread": {
+                "provider": "codex",
+                "provider_session": "codex-worker-thread",
+                "binding_phase": "started",
+            }
+        }
+        codex.read_thread = lambda *_args, **_kwargs: self.fail(
+            "a thread this adapter started is attested from its start reply"
+        )
+        codex.native_approval_handler = scheduler.review_approval
+        self.managed.bind_thread(
+            agent_id=worker.agent_id,
+            thread_id="codex-worker-thread",
+            start_result=policy(),
+            tool_handler=None,
+            adapter=codex,
+        )
+
+        with patch("vnext.vnext_scheduler.APPROVAL_ROUTING_GRACE_SECONDS", 0.2):
+            answer = codex._handle_native_approval(
+                "item/commandExecution/requestApproval",
+                {
+                    "itemId": "call-ps",
+                    "threadId": "codex-worker-thread",
+                    "turnId": "codex-worker-turn",
+                },
+            )
+
+        self.assertEqual({"decision": "accept"}, answer)
+        resolved = [data for kind, _agent, data in lifecycle if kind == "approval_resolved"]
+        self.assertEqual(["standing-grant"], [data["resolver"] for data in resolved])
+
+    def test_an_unrouted_approval_is_declined_and_recorded(self) -> None:
+        lifecycle: list[tuple[str, str, dict]] = []
+        scheduler = VNextScheduler(
+            managed=self.managed,
+            root=self.root,
+            cancellation=RunCancellation(),
+            hooks=SchedulerHooks(
+                lifecycle=lambda kind, agent, data: lifecycle.append(
+                    (kind, agent.agent_id, dict(data))
+                )
+            ),
+        )
+
+        with patch("vnext.vnext_scheduler.APPROVAL_ROUTING_GRACE_SECONDS", 0.05):
+            answer = scheduler.review_approval(
+                "approval/request",
+                {
+                    "approval_reference": "approval:call-ps",
+                    "provider": "codex",
+                    "provider_correlation": {
+                        "session": "thread-nobody-owns",
+                        "turn": "some-turn",
+                        "request": "call-ps",
+                    },
+                    "correlation_attested": True,
+                    "effect": "execute",
+                },
+            )
+
+        self.assertEqual(
+            {"decision": "decline", "reason": _BOUNDARY_DECLINE_REASONS["unrouted"]},
+            answer,
+        )
+        self.assertEqual(
+            ["approval_requested", "approval_resolved"],
+            [kind for kind, _agent, _data in lifecycle],
+        )
+        (_, requested_on, requested), (_, resolved_on, resolved) = lifecycle
+        # Recorded on the session root, and it names no worker it never reached.
+        self.assertEqual(self.root.agent_id, requested_on)
+        self.assertEqual(self.root.agent_id, resolved_on)
+        self.assertNotIn("worker_agent", requested)
+        self.assertEqual("codex", requested["provider"])
+        self.assertEqual("thread-nobody-owns", requested["provider_session"])
+        self.assertEqual("execute", requested["effect"])
+        self.assertEqual(requested["approval_id"], resolved["approval_id"])
+        self.assertEqual("decline", resolved["decision"])
+        self.assertEqual("vnext-approval-boundary", resolved["resolver"])
+        self.assertEqual(_BOUNDARY_DECLINE_REASONS["unrouted"], resolved["reason"])
+        self.assertEqual(
+            _BOUNDARY_DECLINE_REASONS["unrouted"],
+            scheduler.native_approval_records()[-1]["reason"],
+        )
+
+    def test_an_unrouted_local_reservation_is_not_named_a_provider_session(
+        self,
+    ) -> None:
+        lifecycle: list[tuple[str, str, dict]] = []
+        scheduler = VNextScheduler(
+            managed=self.managed,
+            root=self.root,
+            cancellation=RunCancellation(),
+            hooks=SchedulerHooks(
+                lifecycle=lambda kind, agent, data: lifecycle.append(
+                    (kind, agent.agent_id, dict(data))
+                )
+            ),
+        )
+
+        with patch("vnext.vnext_scheduler.APPROVAL_ROUTING_GRACE_SECONDS", 0.05):
+            answer = scheduler.review_approval(
+                "approval/request",
+                {
+                    "approval_reference": "approval:call-ps",
+                    "provider": "claude",
+                    "routing_handle": {
+                        "reservation_id": "local-unowned-reservation",
+                        "turn_reference": "local-turn",
+                    },
+                    "correlation_attested": False,
+                    "effect": "execute",
+                },
+            )
+
+        self.assertEqual(
+            {"decision": "decline", "reason": _BOUNDARY_DECLINE_REASONS["unrouted"]},
+            answer,
+        )
+        (_, requested_on, requested), _resolved = lifecycle
+        self.assertEqual(self.root.agent_id, requested_on)
+        self.assertNotIn("provider_session", requested)
+        self.assertEqual("local-unowned-reservation", requested["routing_reservation"])
+
     def test_a_read_outside_the_workspace_reaches_the_reviewer(self) -> None:
         request = self._approval_request_for(
             {
@@ -11044,3 +11275,19 @@ class ProviderFailureOutcomeRecordTests(unittest.TestCase):
                             self.assertEqual("completed", rows[0]["status"])
                     finally:
                         service.close()
+
+VNextSchedulerTests.test_delegate_does_not_read_counts_as_minutes = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(VNextSchedulerTests.test_delegate_does_not_read_counts_as_minutes)
+
+VNextSchedulerTests.test_delegate_omits_warnings_for_clean_objective = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(VNextSchedulerTests.test_delegate_omits_warnings_for_clean_objective)
+
+VNextSchedulerTests.test_delegate_returns_invalid_effort_as_a_tool_result_before_spawn = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(VNextSchedulerTests.test_delegate_returns_invalid_effort_as_a_tool_result_before_spawn)
+
+VNextSchedulerTests.test_delegate_succeeds_when_preflight_warnings_raise = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(VNextSchedulerTests.test_delegate_succeeds_when_preflight_warnings_raise)
+
+VNextSchedulerTests.test_delegate_time_warning_is_route_aware = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(VNextSchedulerTests.test_delegate_time_warning_is_route_aware)
+
+VNextSchedulerTests.test_delegate_warns_when_objective_exceeds_turn_cap = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(VNextSchedulerTests.test_delegate_warns_when_objective_exceeds_turn_cap)
+
+VNextSchedulerTests.test_delegate_warns_when_objective_needs_browser = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(VNextSchedulerTests.test_delegate_warns_when_objective_needs_browser)
+
+VNextSchedulerTests.test_replace_refuses_effort_inherited_by_incompatible_provider = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(VNextSchedulerTests.test_replace_refuses_effort_inherited_by_incompatible_provider)

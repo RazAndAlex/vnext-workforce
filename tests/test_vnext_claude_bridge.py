@@ -39,6 +39,7 @@ from vnext.vnext_claude_bridge import (
     _Bridge,
     _CREDENTIAL_OVERRIDES,
     _MAX_PENDING_EFFECTS,
+    _MAX_PENDING_SYSTEM_MESSAGES,
     _TOOL_EFFECTS,
 )
 from vnext.vnext_claude_native_identity import NativeChildIdentity, NativeChildIdentityError
@@ -1244,6 +1245,47 @@ class ClaudeOwnedBridgeTests(unittest.TestCase):
         self.assertEqual("init", projected[0].payload["subtype"])
         self.assertEqual(["compact", "context"], projected[0].payload["data"]["slash_commands"])
         self.assert_clean(adapter)
+
+    def test_sdk_options_allow_base64_image_messages_up_to_64_mib(self) -> None:
+        class FakeSDK:
+            @staticmethod
+            def ClaudeAgentOptions(**kwargs: object) -> object:
+                return SimpleNamespace(**kwargs)
+
+            @staticmethod
+            def HookMatcher(**kwargs: object) -> object:
+                return SimpleNamespace(**kwargs)
+
+        FakeSDK.ClaudeAgentOptions.__dataclass_fields__ = {"max_buffer_size": None}
+        bridge = _Bridge()
+        bridge._workspace = Path(self.workspace)
+        bridge._sdk = FakeSDK()
+        options = bridge._options(
+            model=CLAUDE_WORKER_MODEL, resume=None, reservation_id="reservation-a",
+        )
+        self.assertEqual(64 * 1024 * 1024, options.max_buffer_size)
+
+    def test_sdk_options_omit_image_buffer_for_older_sdks(self) -> None:
+        class FakeSDK:
+            @staticmethod
+            def ClaudeAgentOptions(**kwargs: object) -> object:
+                self.assertNotIn("max_buffer_size", kwargs)
+                return SimpleNamespace(**kwargs)
+
+            @staticmethod
+            def HookMatcher(**kwargs: object) -> object:
+                return SimpleNamespace(**kwargs)
+
+        bridge = _Bridge()
+        bridge._workspace = Path(self.workspace)
+        bridge._sdk = FakeSDK()
+        for fields in (None, {}):
+            with self.subTest(dataclass_fields=fields):
+                if fields is not None:
+                    FakeSDK.ClaudeAgentOptions.__dataclass_fields__ = fields
+                bridge._options(
+                    model=CLAUDE_WORKER_MODEL, resume=None, reservation_id="reservation-a",
+                )
 
     def test_fake_sdk_reservation_then_first_turn_binds_emitted_identity(self) -> None:
         class AssistantMessage:
@@ -4630,6 +4672,46 @@ class ClaudeBridgePendingStreamDeltaTests(unittest.TestCase):
             "content": {"type": "thinking_delta", "thinking": "step-" + str(index)},
         }
 
+    def test_query_survives_96_system_messages_before_identity_binding(self) -> None:
+        """System status bursts must not consume the whole-message budget."""
+        class SystemMessage:
+            subtype = "status"
+            data = {"session_id": "native-a", "status": "busy", "stdout": "secret"}
+
+        class StreamEvent:
+            event = {"delta": {"type": "text_delta", "text": "OK"}}
+
+        class ResultMessage:
+            session_id, result = "native-a", "OK"
+            usage = total_cost_usd = model_usage = None
+            duration_ms = duration_api_ms = num_turns = None
+            is_error, stop_reason, subtype = False, None, "success"
+            api_error_status, terminal_reason, errors = None, None, ()
+
+        class Client:
+            async def query(self, prompt):
+                pass
+
+            async def receive_messages(self):
+                for _ in range(96):
+                    yield SystemMessage()
+                yield StreamEvent()
+                yield ResultMessage()
+
+        self.bridge._sdk, self.bridge._workspace = object(), Path.cwd()
+        self.state["client"] = Client()
+        written = []
+        with patch("vnext.vnext_claude_bridge._write", side_effect=written.append):
+            asyncio.run(self.bridge._run_query("reservation-a", 1, "fixture"))
+        self.assertEqual("native-a", self.state["session_id"])
+        events = [row["event"] for row in written]
+        systems = [event for event in events if event["name"] == "system_message"]
+        self.assertEqual(96, len(systems))
+        self.assertTrue(all(event["correlation_attested"] for event in systems))
+        self.assertTrue(all(event["data"] == {"session_id": "native-a"} for event in systems))
+        self.assertEqual(1, sum(event["name"] == "stream" for event in events))
+        self.assertEqual([], self.state["pending_messages"])
+
     def test_a_thinking_flood_before_binding_keeps_the_reservation_alive(self) -> None:
         """This is the GLM-5.3 failure: high effort, no session id yet."""
 
@@ -4695,6 +4777,42 @@ class ClaudeBridgePendingStreamDeltaTests(unittest.TestCase):
             self.bridge._release_or_hold_message(self.state, self._delta(0))
 
         self.assertEqual(_MAX_PENDING_EFFECTS, len(self.state["pending_messages"]))
+
+    def test_system_messages_do_not_displace_stream_deltas(self) -> None:
+        """System and transcript events retain their independent budgets."""
+
+        for index in range(30):
+            self.bridge._release_or_hold_message(self.state, self._delta(index))
+        for index in range(_MAX_PENDING_EFFECTS - 30):
+            self.bridge._release_or_hold_message(
+                self.state,
+                {"name": "system_message", "generation": 1, "subtype": "hook_started", "data": {"n": index}},
+            )
+
+        arriving = {"name": "system_message", "generation": 1, "subtype": "hook_response", "data": {}}
+        self.bridge._release_or_hold_message(self.state, arriving)
+
+        pending = self.state["pending_messages"]
+        self.assertEqual(_MAX_PENDING_EFFECTS + 1, len(pending))
+        self.assertEqual(0, self.state["dropped_stream_deltas"])
+        self.assertEqual(arriving, pending[-1])
+        self.assertEqual("step-0", pending[0]["content"]["thinking"])
+        self.assertEqual(30, sum(1 for held in pending if held["name"] == "stream"))
+
+    def test_system_budget_stays_bounded_without_weakening_whole_message_guard(self) -> None:
+        system = {"name": "system_message", "generation": 1, "subtype": "status", "data": {}}
+        for _ in range(_MAX_PENDING_SYSTEM_MESSAGES):
+            self.bridge._release_or_hold_message(self.state, system)
+        with self.assertRaisesRegex(BridgeError, "system message capacity exceeded"):
+            self.bridge._release_or_hold_message(self.state, system)
+        for index in range(_MAX_PENDING_EFFECTS):
+            self.bridge._release_or_hold_message(
+                self.state, {"name": "message", "generation": 1, "message": {"sequence": index}},
+            )
+        with self.assertRaisesRegex(BridgeError, "pending message capacity exceeded"):
+            self.bridge._release_or_hold_message(self.state, {"name": "message", "message": {}})
+        self.assertEqual(_MAX_PENDING_SYSTEM_MESSAGES + _MAX_PENDING_EFFECTS,
+                         len(self.state["pending_messages"]))
 
     def test_the_flush_says_how_many_deltas_it_lost(self) -> None:
         for index in range(_MAX_PENDING_EFFECTS + 5):

@@ -35,7 +35,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from .vnext_scheduler import DEFAULT_TURN_TIMEOUT
 from .clock_format import format_time
+from .vnext_claude_bridge import _MAX_JSONL, _SDK_MAX_BUFFER_SIZE
 from .host_contract import SessionStartRequest
 from .vnext_model_identity import UNKNOWN as EXACT_MODEL_UNKNOWN, resolve_claude_alias
 from .release_check import RELEASE_CODEX_MODEL_COMPATIBILITY, RELEASE_CODEX_VERSION
@@ -71,6 +73,7 @@ from .vnext_runtimes import (
     session_runtime_config,
     untested_catalog_entries,
 )
+from . import vnext_session_runtime as session_runtime
 from .vnext_session_runtime import PROVIDERS, VNextRuntimeSession, _catalog_claims
 
 
@@ -109,6 +112,10 @@ DEFAULT_CATALOG: tuple[dict[str, Any], ...] = (
     {"provider": "zai", "model": "glm-5.3"},
     {"provider": "zai", "model": "glm-5.2"},
     {"provider": "commandcode", "model": "deepseek/deepseek-v4.1-flash"},
+)
+DEFAULT_CATALOG = tuple(
+    entry for entry in DEFAULT_CATALOG
+    if entry["provider"] != "claude" or session_runtime.CLAUDE_SUBSCRIPTION_WORKERS
 )
 
 SERVER_INFO = {"name": "vnext", "version": "1"}
@@ -211,6 +218,8 @@ def _model_roster(entries: Sequence[Mapping[str, Any]]) -> str:
     for entry in entries:
         model = entry.get("model") or entry.get("model_id")
         provider = str(entry.get("provider") or "")
+        if provider == "claude" and not session_runtime.CLAUDE_SUBSCRIPTION_WORKERS:
+            continue
         harness = PROVIDERS.get(provider, (None, None))[0]
         runs_on = f"{provider} via {harness}" if harness else provider
         claims = entry.get("claims")
@@ -232,6 +241,21 @@ def _external_tools(
     tools: Sequence[Mapping[str, Any]],
     entries: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[dict[str, Any], ...]:
+    limits = (
+        f" Worker limits: a turn has a {DEFAULT_TURN_TIMEOUT} s ({DEFAULT_TURN_TIMEOUT / 60:g} min) budget."
+        + (" On Claude and GLM routes (claude, zai)" if session_runtime.CLAUDE_SUBSCRIPTION_WORKERS
+           else " On GLM routes (zai)")
+        + " it is a wall-clock cap; split longer jobs across turns or children."
+        " On Codex and Command Code routes (codex, commandcode) every turn event renews it,"
+        " so only a turn with no activity for that long is cut."
+        f" A Claude-route tool result/image message can be up to {_SDK_MAX_BUFFER_SIZE // (1024 * 1024)} MiB,"
+        " subject also to the provider API's own request-size limit;"
+        f" one bridge output line is limited to {_MAX_JSONL // 1024} KiB."
+        " vNext provides no browser of its own: a worker has one only if the user's own config"
+        " (Claude settings or ~/.codex) enables a browser MCP server; Codex workers run with network restricted."
+        ' Before complete_agent, read unread inbox messages with inspect self and acknowledge_messages_through;'
+        ' otherwise completion is refused with unread-messages (prompt-delivered mail requires another turn).'
+    )
     roster = _model_roster(entries) if entries else ""
     projected = []
     for tool in tools:
@@ -249,6 +273,8 @@ def _external_tools(
         # Both tools that choose a model carry the roster.
         if roster and name in {"delegate", "replace"}:
             entry["description"] = str(entry.get("description", "")) + roster
+        if name in {"delegate", "replace"}:
+            entry["description"] = str(entry.get("description", "")) + limits
         projected.append(entry)
     return tuple(projected)
 
@@ -592,6 +618,8 @@ def _claude_login_state() -> str:
     they were already signed in to.
     """
 
+    if not session_runtime.CLAUDE_SUBSCRIPTION_WORKERS:
+        return CLAUDE_LOGIN_ABSENT
     executable = _claude_executable()
     if executable is None:
         return CLAUDE_LOGIN_ABSENT
@@ -670,6 +698,8 @@ def _validate_catalog(
         if not isinstance(model, str) or not model.strip():
             raise VNextMcpServiceError(f"{prefix} requires a non-empty string model")
         provider = entry.get("provider")
+        if provider == "claude" and not session_runtime.CLAUDE_SUBSCRIPTION_WORKERS:
+            raise VNextMcpServiceError(session_runtime.CLAUDE_WORKERS_UNAVAILABLE)
         if not isinstance(provider, str) or provider not in backed:
             raise VNextMcpServiceError(
                 f"{prefix} (model {model!r}) names provider {provider!r}, which is neither "
@@ -705,7 +735,8 @@ def _validate_catalog(
     ):
         entries = [entry for entry in entries if entry.get("provider") != "codex"]
     if (
-        "claude" not in factories
+        session_runtime.CLAUDE_SUBSCRIPTION_WORKERS
+        and "claude" not in factories
         and any(entry.get("provider") == "claude" for entry in entries)
         and not probe.claude_available()
     ):
@@ -737,16 +768,18 @@ def _validate_catalog(
     if not entries:
         message = (
             "a workforce needs at least one available worker model; sign in to "
-            "Codex or Claude, or configure a Z.ai or Command Code provider key"
+            + ("Codex or Claude" if session_runtime.CLAUDE_SUBSCRIPTION_WORKERS else "Codex")
+            + ", or configure a Z.ai or Command Code provider key"
         )
         if not _claude_sdk_installed():
-            message += f"; claude and zai models are left out because {CLAUDE_SDK_MISSING}"
+            sdk_providers = "claude and zai" if session_runtime.CLAUDE_SUBSCRIPTION_WORKERS else "zai"
+            message += f"; {sdk_providers} models are left out because {CLAUDE_SDK_MISSING}"
         # A file that exists and is wrong used to read as a file that is absent,
         # so the one message a person is sent to told them to configure the key
         # they had already written.
         for fault in provider_config_problems():
             message += f"; {fault}"
-        if probe.claude_state() == CLAUDE_LOGIN_UNCHECKED:
+        if session_runtime.CLAUDE_SUBSCRIPTION_WORKERS and probe.claude_state() == CLAUDE_LOGIN_UNCHECKED:
             message += (
                 "; the Claude login could not be checked, because "
                 f"'claude auth status' did not answer within "
@@ -1407,6 +1440,41 @@ class VNextMcpService:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    def _logged_status(self, agent_id: str) -> str | None:
+        """Latest status the session run log holds for one agent, read from the end."""
+
+        path = self.workspace.resolve() / ".vnext" / "runs" / f"{self._session_id}.jsonl"
+        block, limit = 1024 * 1024, 32 * 1024 * 1024
+        needle = agent_id.encode("utf-8")
+        try:
+            with path.open("rb") as handle:
+                end = handle.seek(0, os.SEEK_END)
+                position, tail = end, b""
+                while position > 0 and end - position < limit:
+                    step = min(block, position)
+                    position -= step
+                    handle.seek(position)
+                    lines = (handle.read(step) + tail).split(b"\n")
+                    # The first piece may be a cut line; carry it into the next block.
+                    tail = lines[0] if position > 0 else b""
+                    for raw in reversed(lines[1:] if position > 0 else lines):
+                        if needle not in raw or b"agent.upsert" not in raw:
+                            continue
+                        try:
+                            row = json.loads(raw)
+                        except ValueError:
+                            continue
+                        payload = row.get("payload") if isinstance(row, dict) else None
+                        if (
+                            isinstance(payload, dict) and row.get("type") == "agent.upsert"
+                            and row.get("agent_id") == agent_id
+                            and isinstance(payload.get("status"), str)
+                        ):
+                            return payload["status"]
+        except OSError:
+            return None
+        return None
+
     # -- the two seams -----------------------------------------------------
 
     def _dispatch(
@@ -1434,17 +1502,49 @@ class VNextMcpService:
                 "error": session_closing_message(tool),
                 "error_code": SESSION_CLOSING_CODE,
             }
+        since_offset = None
+        message_target = None
+        if tool == "send_message":
+            target = arguments.get("agent_id")
+            # A running worker is already covered by its own waiter; an idle
+            # one starts a new turn that nothing is waiting on.
+            if isinstance(target, str) and self._logged_status(target) == "ready":
+                message_target = target
+        if tool == "retry" or message_target is not None:
+            # A retried agent keeps its id and its old settled row in this log.
+            # The waiter reads only what is written after this point.
+            try:
+                since_offset = (
+                    self.workspace.resolve() / ".vnext" / "runs" / f"{self._session_id}.jsonl"
+                ).stat().st_size
+            except OSError:
+                since_offset = 0
         try:
             result = self.session.external_tool_call(tool=tool, arguments=arguments)
         except Exception as exc:
             return {"success": False, "error": str(exc), "error_code": "external-dispatch"}
-        if tool == "delegate" and isinstance(result, ToolCallResult) and result.success:
+        woken_agent = None
+        if (
+            tool in {"delegate", "retry", "replace"}
+            and isinstance(result, ToolCallResult) and result.success
+            and isinstance(result.value, Mapping) and result.value.get("agent_id")
+        ):
+            woken_agent = str(result.value["agent_id"])
+        elif (
+            message_target is not None
+            and isinstance(result, ToolCallResult) and result.success
+            and isinstance(result.value, Mapping)
+        ):
+            woken_agent = message_target
+        if woken_agent is not None:
             command = [
                 sys.executable, "-m", "vnext.vnext_wait",
                 "--workspace", str(self.workspace.resolve()),
-                "--agent", str(result.value["agent_id"]),
+                "--agent", woken_agent,
                 "--session", self._session_id, "--deadline", "30m",
             ]
+            if since_offset is not None:
+                command += ["--since-offset", str(since_offset)]
             wake_command = subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
             result = ToolCallResult(True, {**dict(result.value), "wake_command": wake_command})
         notice = list(getattr(self, "_runtime_notice", None) or ())
@@ -2395,15 +2495,17 @@ def startup_check_notes(
     notes: list[str] = []
     if named is not None:
         for provider in ("codex", "claude", "zai", "commandcode"):
+            if provider == "claude" and not session_runtime.CLAUDE_SUBSCRIPTION_WORKERS:
+                continue
             if provider not in offered and provider not in named:
                 notes.append(f"{provider} models left out: the catalog names none")
                 offered.add(provider)
     if "codex" not in offered:
         problem = _codex_login_problem()
         notes.append(f"codex models left out: {problem or 'the catalog names none'}")
-    if "claude" not in offered and not _claude_sdk_installed():
+    if session_runtime.CLAUDE_SUBSCRIPTION_WORKERS and "claude" not in offered and not _claude_sdk_installed():
         notes.append(f"claude models left out: {CLAUDE_SDK_MISSING}")
-    elif "claude" not in offered:
+    elif session_runtime.CLAUDE_SUBSCRIPTION_WORKERS and "claude" not in offered:
         state = probe.claude_state()
         if state == CLAUDE_LOGIN_AVAILABLE:
             reason = "the catalog names none"

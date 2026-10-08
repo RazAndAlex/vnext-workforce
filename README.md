@@ -26,8 +26,10 @@ many tokens. It stays in your project.
 
 ## What it does
 
-- Starts workers on Claude or OpenAI Codex with your own logins, and on Z.ai
-  or Command Code with an API key. See [Models](#models).
+- Starts workers on OpenAI Codex with your own login, and on Z.ai or Command
+  Code with an API key. See [Models](#models).
+- Leaves Claude work to Claude Code's own subagents. See
+  [Why vNext has no Claude workers](#no-claude).
 - Lets Claude Code wait for a worker, send it a message, stop it or retry it.
 - Writes a record of every worker into your project. See
   [Where the records go](#records).
@@ -99,10 +101,16 @@ vNext offers each model that your own logins and keys can reach. When a
 provider has no login or key, its models do not appear. To see the list on
 your machine, run `vnext-mcp --check`.
 
-Claude workers need `claude auth login`. Codex workers need `codex login`, and
-they use your usual Codex login folder. That is `~/.codex`, or the folder that
-`CODEX_HOME` names when Claude Code starts. Z.ai and Command Code workers need
-an [API key](#api-keys).
+Codex workers need `codex login`, and they use your usual Codex login folder.
+That is `~/.codex`, or the folder that `CODEX_HOME` names when Claude Code
+starts. Z.ai and Command Code workers need an [API key](#api-keys).
+
+<a name="no-claude"></a>
+**Why vNext has no Claude workers.** Anthropic does not let other products run
+Claude on your Pro or Max login. The rule is on the
+[Agent SDK page](https://code.claude.com/docs/en/agent-sdk/overview). Claude
+Code is the manager, and it runs on your own login. When a job needs Claude,
+Claude Code gives it to one of its own subagents.
 
 </details>
 
@@ -160,8 +168,8 @@ usual:
 
 - **The terminal cannot find `vnext-mcp`.** Run `uv tool update-shell`, then
   quit Claude Code fully and open it again.
-- **No provider has a login or a key.** Run `codex login` or
-  `claude auth login`, or add an [API key](#api-keys).
+- **No provider has a login or a key.** Run `codex login`, or add an
+  [API key](#api-keys).
 
 </details>
 
@@ -171,7 +179,7 @@ usual:
 
 The Codex CLI is about 114 MiB of the download and the Claude Agent SDK about
 88 MiB. The `claude` extra in the install command adds the Claude Agent SDK.
-Claude and Z.ai workers need it.
+Z.ai workers need it.
 
 With Node.js, a small helper called the restart proxy lets Claude Code restart
 the vNext server without a restart of its own. The first start downloads the
@@ -257,7 +265,7 @@ traceback, or `--failures` to see only the workspaces with a failure. Either
 form exits non-zero when it finds a failure or a record it could not read.
 With no path, it reads the folder you are in.
 
-A worker's turn has 30 minutes. vNext stops a Claude or Z.ai turn that runs
+A worker's turn has 30 minutes. vNext stops a Z.ai turn that runs
 past that. A Codex or Command Code turn goes on while the worker keeps working.
 vNext stops it once 30 minutes pass with nothing from it. Either way, what the
 worker wrote stays in your project, and `retry` continues the same session.

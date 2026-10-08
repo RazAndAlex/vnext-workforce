@@ -2,7 +2,7 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_vnext_vnext__delegate",
+        "matcher": "mcp__plugin_vnext_vnext__(delegate|retry|replace|send_message)",
         "hooks": [
           {
             "type": "command",

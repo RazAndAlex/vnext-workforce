@@ -46,7 +46,7 @@ RELEASE_CODEX_MODEL_COMPATIBILITY = {
         "gpt-6.1-sol",
     }),
 }
-VNEXT_VERSION = "0.2.0"
+VNEXT_VERSION = "0.3.0"
 # Hand-maintained release evidence, same as the model compatibility table above.
 # Each wheel of openai-codex-cli-bin ships a different set of executables, so the
 # pinned digests are per platform.  Recompute every map whenever

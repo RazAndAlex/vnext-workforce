@@ -354,7 +354,9 @@ class VNextAppServerShutdownTests(unittest.TestCase):
 
         self.assertTrue(identity["bound"])
         self.assertEqual("fresh-thread", identity["provider_session"])
-        self.assertEqual("started", identity["binding_phase"])
+        # vNext started this thread and holds the provider's own reply, so the
+        # identity is attested; the router accepts nothing weaker.
+        self.assertEqual("attested", identity["binding_phase"])
 
     def test_provider_read_attestation_is_retained_for_native_child_discovery(self) -> None:
         adapter = self._native_child_adapter()

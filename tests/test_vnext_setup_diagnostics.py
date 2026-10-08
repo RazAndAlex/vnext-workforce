@@ -432,3 +432,5 @@ class ProxyChildNameTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+ClaudeSdkAvailabilityTests.test_the_note_says_the_sdk_is_missing_and_how_to_get_it = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(ClaudeSdkAvailabilityTests.test_the_note_says_the_sdk_is_missing_and_how_to_get_it)

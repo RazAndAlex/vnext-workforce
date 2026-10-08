@@ -1059,3 +1059,5 @@ class ACleanCloseIsRecordedAsOneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+ExternalPrimarySessionTest.test_bad_claude_effort_is_refused_without_spawn_or_event = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(ExternalPrimarySessionTest.test_bad_claude_effort_is_refused_without_spawn_or_event)

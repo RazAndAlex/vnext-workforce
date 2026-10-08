@@ -2,7 +2,7 @@
 
 This plugin points Claude Code at a vNext control tree. Claude Code stays the
 root: it keeps its own conversation, its own permissions and its own user, and
-gains thirteen manager tools with which it can start Codex and Claude workers in
+gains thirteen manager tools with which it can start Codex, Z.ai and Command Code workers in
 this workspace, wait for them, steer them and judge what they return.
 
 vNext never runs a turn on the root and never claims it can stop it. That is the
@@ -20,7 +20,7 @@ claude plugin marketplace add ./plugins
 claude plugin install vnext@vnext
 ```
 
-The `claude` extra installs `claude-agent-sdk==0.2.143`, which Claude and Z.ai
+The `claude` extra installs `claude-agent-sdk==0.2.143`, which Z.ai
 workers require. After a `git pull`, run `uv tool install --force ".[claude]"`
 again from the clone to replace the server copy in uv's tool environment.
 `claude plugin install` copies the skill into Claude Code's plugin cache, and
@@ -68,11 +68,11 @@ causes cover almost every failure.
   start Claude Code from that terminal, which hands it the PATH you just proved.
   "Running it by hand instead", below, needs no PATH at all.
 - No provider has a login or a key, so there is no worker model to offer. Run
-  `codex login` or `claude auth login`, or write a provider key into the provider
+  `codex login`, or write a provider key into the provider
   file named below.
 
-Sign in with `codex login` to offer Codex workers and with `claude auth login` to
-offer Claude workers. Z.ai and Command Code models require their provider keys
+Sign in with `codex login` to offer Codex workers. Claude Code does Claude work
+with its own subagents. Z.ai and Command Code models require their provider keys
 in `~/.vnext/providers.json`; nothing creates that folder. On macOS,
 run `mkdir -p ~/.vnext` before writing the file. On Windows, run
 `New-Item -ItemType Directory -Force "$HOME\.vnext"` in PowerShell;
@@ -103,7 +103,7 @@ to load with `cache-miss`, and the vnext server disappears from `/mcp`. Moving
 the folder back restores both.
 
 Codex workers use the pinned CLI on Apple-silicon macOS (`darwin-arm64`) and
-64-bit Windows (`win32-amd64`). Claude and Z.ai workers use the Claude Agent SDK
+64-bit Windows (`win32-amd64`). Z.ai workers use the Claude Agent SDK
 on hosts where Python 3.11 or newer and that SDK run. Command Code workers
 currently use the same pinned Codex CLI as Codex workers, so their default
 route has the same two-platform limit.
@@ -148,7 +148,7 @@ needs `uv` on PATH, just like the plugin's server launcher.
   effort, duration, token counts, an API-equivalent `cost_usd` where the model
   carries a price, and the agent's own `claimed_verified` / `claimed_outcome`.
   That is the file a rating pass reads. The claim fields are named as claims: a
-  worker saying it verified its work is not a verdict on that work. A Claude
+  worker saying it verified its work is not a verdict on that work. A Z.ai
   worker's subagent has its tokens and cost counted in its parent's row; its own row says
   `in_parent`.
 
@@ -170,7 +170,7 @@ non-zero, so a watcher can ask the question in a script. With no path it reads
 the current directory, so give the path when you run it from the repository.
 
 A worker's turn has 30 minutes. The worker reads that limit at the top of each
-turn. A Claude or Z.ai turn that runs past it is stopped. A Codex or Command Code
+turn. A Z.ai turn that runs past it is stopped. A Codex or Command Code
 turn runs on while it keeps working, and is stopped once 30 minutes pass with
 nothing from it; `interrupt_agent` stops it sooner. Either way the worker's
 blocker says the turn reached its limit. What it wrote stays in the workspace,
@@ -180,14 +180,14 @@ When you quit the server, a provider can still send an error for a worker that
 had already finished. The report shows that error as a note under the session.
 The session still counts as a success, so `--failures` leaves it out.
 
-A Claude worker runs a real Claude Code, which starts a vNext server of its own
+A Z.ai worker runs a real Claude Code, which starts a vNext server of its own
 in the same project. That server keeps its own session, and the report marks it
 `started inside session`, naming the session it started under. Any other program
 you start from a session carries the same mark. The mark tells you where a
 session began. It does not say who asked for it.
 
 A `provider.error` record in `runs/<session>.jsonl` holds the provider's own words
-about a failure. For a Claude or Z.ai worker it also holds the traceback and the
+about a failure. For a Z.ai worker it also holds the traceback and the
 bridge's own stderr. That text stays on this machine, beside the workspace it
 came from. The failure receipt in `vnext_diagnostics` is a different record: it
 can leave the machine, so it holds labels only.
@@ -222,7 +222,7 @@ catalog its server was started with. Pass `--catalog <path to a catalog JSON
 file>` holding `{"models": [{"provider": "codex", "model": "..."}]}` to change
 that.
 
-A model is offered only when its provider has a login or a key. The Claude
-models need `claude auth login` and the Codex models need `codex login`; the Z.ai
+A model is offered only when its provider has a login or a key. The Codex
+models need `codex login`; the Z.ai
 and Command Code models arrive once their key is in
 `~/.vnext/providers.json`.

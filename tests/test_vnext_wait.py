@@ -433,6 +433,203 @@ class VNextWaitTests(unittest.TestCase):
         service.session.external_tool_call.return_value = ToolCallResult(True, {"agent_id": "worker"})
         self.assertIn("wake_command", service._dispatch("delegate", {}, {}).value)
 
+    def test_since_offset_ignores_the_retried_agents_old_settled_row(self):
+        self.append("worker", "blocked", "2026-10-05T17:00:00+00:00", blocker="Old blocker.")
+        offset = self.log.stat().st_size
+        self.append("worker", "ready", "2026-10-05T17:01:00+00:00")
+        self.append("worker", "running", "2026-10-05T17:01:01+00:00")
+        thread = threading.Thread(target=lambda: (
+            time.sleep(0.05),
+            self.append("worker", "blocked", "2026-10-05T17:02:00+00:00", blocker="New blocker.")))
+        thread.start()
+        try:
+            code, out, _ = self.run_wait(
+                "--agent", "worker", "--session", "session",
+                "--since-offset", str(offset), "--deadline", "30s", real_clock=True)
+        finally:
+            thread.join()
+        self.assertEqual(0, code)
+        self.assertIn("worker blocked 2026-10-05T17:02:00+00:00", out)
+        self.assertIn("New blocker.", out)
+        self.assertNotIn("Old blocker.", out)
+
+    def test_since_offset_without_a_ready_row_between(self):
+        self.append("worker", "failed", "2026-10-05T17:00:00+00:00", blocker="Old failure.")
+        offset = self.log.stat().st_size
+        thread = threading.Thread(target=lambda: (
+            time.sleep(0.05),
+            self.append("worker", "completed", "2026-10-05T17:03:00+00:00",
+                        result={"outcome": "Fresh report."})))
+        thread.start()
+        try:
+            code, out, _ = self.run_wait(
+                "--agent", "worker", "--session", "session",
+                "--since-offset", str(offset), "--deadline", "30s", real_clock=True)
+        finally:
+            thread.join()
+        self.assertEqual(0, code)
+        self.assertIn("worker completed 2026-10-05T17:03:00+00:00\nFresh report.", out)
+
+    def test_without_since_offset_the_old_row_still_settles_at_once(self):
+        self.append("worker", "blocked", blocker="Old blocker.")
+        code, out, _ = self.run_wait("--agent", "worker", "--session", "session")
+        self.assertEqual(0, code)
+        self.assertIn("Old blocker.", out)
+        self.assertEqual(0, self.clock.now)
+
+    def make_service(self):
+        from vnext.vnext_mcp_server import VNextMcpService
+
+        service = VNextMcpService.__new__(VNextMcpService)
+        service._closing = False
+        service.workspace = self.workspace
+        service._session_id = "session"
+        return service
+
+    def test_external_retry_wake_command_waits_only_for_new_rows(self):
+        from vnext.vnext_runtime_types import ToolCallResult
+
+        self.append("worker", "blocked", blocker="Old blocker.")
+        size = self.log.stat().st_size
+        service = self.make_service()
+        service.session = SimpleNamespace(external_tool_call=Mock(
+            return_value=ToolCallResult(True, {"agent_id": "worker", "status": "ready"})))
+        with patch("vnext.vnext_mcp_server.sys.executable", "/Python Install/bin/python"):
+            reply = service._dispatch("retry", {"agent_id": "worker"}, {})
+        command = [
+            "/Python Install/bin/python", "-m", "vnext.vnext_wait",
+            "--workspace", str(self.workspace.resolve()), "--agent", "worker",
+            "--session", "session", "--deadline", "30m", "--since-offset", str(size)]
+        quote = subprocess.list2cmdline if os.name == "nt" else shlex.join
+        self.assertEqual(quote(command), reply.value["wake_command"])
+
+    def test_external_replace_wake_command_names_the_new_agent(self):
+        from vnext.vnext_runtime_types import ToolCallResult
+
+        service = self.make_service()
+        service.session = SimpleNamespace(external_tool_call=Mock(
+            return_value=ToolCallResult(True, {"agent_id": "new-child", "status": "ready"})))
+        with patch("vnext.vnext_mcp_server.sys.executable", "/Python Install/bin/python"):
+            reply = service._dispatch("replace", {"agent_id": "old"}, {})
+        command = [
+            "/Python Install/bin/python", "-m", "vnext.vnext_wait",
+            "--workspace", str(self.workspace.resolve()), "--agent", "new-child",
+            "--session", "session", "--deadline", "30m"]
+        quote = subprocess.list2cmdline if os.name == "nt" else shlex.join
+        self.assertEqual(quote(command), reply.value["wake_command"])
+
+    def test_rejected_retry_and_other_tools_have_no_wake_command(self):
+        from vnext.vnext_runtime_types import ToolCallResult
+
+        service = self.make_service()
+        service.session = SimpleNamespace(external_tool_call=Mock(
+            return_value=ToolCallResult(False, {"error": "no"})))
+        self.assertNotIn("wake_command", service._dispatch("retry", {}, {}).value)
+        service.session.external_tool_call.return_value = ToolCallResult(True, {"agent_id": "w"})
+        self.assertNotIn("wake_command", service._dispatch("send_message", {}, {}).value)
+
+    def row(self, kind, agent="worker", timestamp="2026-10-05T17:00:00+00:00", **payload):
+        with self.log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "type": kind, "session_id": "session", "agent_id": agent,
+                "timestamp": timestamp, "payload": payload,
+            }) + "\n")
+
+    def test_ready_after_a_finished_turn_wakes_after_the_grace(self):
+        from vnext.vnext_wait import READY_GRACE_SECONDS
+
+        self.append("worker", "running")
+        self.row("turn.started")
+        self.row("turn.completed", timestamp="2026-10-05T17:05:00+00:00")
+        self.row("command.acknowledged", agent="parent", command="send_message",
+                 sender_id="worker", message="All done, see the diff.")
+        self.append("worker", "ready")
+        code, out, _ = self.run_wait("--agent", "worker")
+        self.assertEqual(0, code)
+        self.assertGreaterEqual(self.clock.now, READY_GRACE_SECONDS)
+        self.assertIn("worker ready 2026-10-05T17:05:00+00:00", out)
+        self.assertIn("ended its turn without a final report", out)
+        self.assertIn("All done, see the diff.", out)
+
+    def test_ready_turn_end_without_a_message_uses_the_fallback_text(self):
+        self.row("turn.started")
+        self.row("turn.completed")
+        self.append("worker", "ready")
+        code, out, _ = self.run_wait("--agent", "worker")
+        self.assertEqual(0, code)
+        self.assertIn("ended its turn without a final report", out)
+        self.assertIn("sent no message", out)
+
+    def test_ready_before_any_turn_does_not_wake(self):
+        self.append("worker", "ready")
+        code, out, _ = self.run_wait("--agent", "worker", "--deadline", "30s")
+        self.assertEqual(3, code)
+        self.assertIn("worker ready still running", out)
+
+    def test_a_new_turn_within_the_grace_does_not_wake(self):
+        self.append("worker", "ready")
+        self.row("turn.started")
+        self.row("turn.completed")
+        calls = {"n": 0}
+        original = self.clock.sleep
+
+        def sleep(seconds):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                self.row("turn.started")
+                self.append("worker", "running")
+            original(seconds)
+
+        from vnext.vnext_wait import main
+
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = main(["--workspace", str(self.workspace), "--agent", "worker",
+                         "--deadline", "30s"], clock=self.clock, sleep=sleep)
+        self.assertEqual(3, code)
+        self.assertNotIn("without a final report", out.getvalue())
+
+    def test_blocked_and_completed_still_wake_at_once(self):
+        self.row("turn.started")
+        self.row("turn.completed")
+        self.append("worker", "blocked", blocker="Need input.")
+        code, out, _ = self.run_wait("--agent", "worker")
+        self.assertEqual(0, code)
+        self.assertEqual(0, self.clock.now)
+        self.assertIn("worker blocked", out)
+
+    def test_since_offset_ignores_turn_rows_before_it(self):
+        self.row("turn.started")
+        self.row("turn.completed")
+        self.append("worker", "ready")
+        offset = self.log.stat().st_size
+        self.append("worker", "ready")
+        code, out, _ = self.run_wait("--agent", "worker", "--session", "session",
+                                     "--since-offset", str(offset), "--deadline", "30s")
+        self.assertEqual(3, code)
+
+    def test_external_send_message_wake_depends_on_the_target_being_idle(self):
+        from vnext.vnext_runtime_types import ToolCallResult
+
+        self.append("worker", "ready")
+        size = self.log.stat().st_size
+        service = self.make_service()
+        service.session = SimpleNamespace(external_tool_call=Mock(
+            return_value=ToolCallResult(True, {"status": "queued", "target_id": "worker"})))
+        with patch("vnext.vnext_mcp_server.sys.executable", "/Python Install/bin/python"):
+            reply = service._dispatch("send_message", {"agent_id": "worker", "message": "go"}, {})
+            command = [
+                "/Python Install/bin/python", "-m", "vnext.vnext_wait",
+                "--workspace", str(self.workspace.resolve()), "--agent", "worker",
+                "--session", "session", "--deadline", "30m", "--since-offset", str(size)]
+            quote = subprocess.list2cmdline if os.name == "nt" else shlex.join
+            self.assertEqual(quote(command), reply.value["wake_command"])
+            self.append("worker", "running")
+            reply = service._dispatch("send_message", {"agent_id": "worker", "message": "go"}, {})
+            self.assertNotIn("wake_command", reply.value)
+            reply = service._dispatch("send_message", {"agent_id": "unknown", "message": "go"}, {})
+            self.assertNotIn("wake_command", reply.value)
+
 
 if __name__ == "__main__":
     unittest.main()

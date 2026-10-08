@@ -163,8 +163,35 @@ class ModelRosterTests(unittest.TestCase):
         self.assertIn("gpt-6-luna", delegate["description"])
         self.assertIn("effort high", delegate["description"])
 
+    def test_delegate_and_replace_descriptions_include_worker_limits(self) -> None:
+        tools = server._external_tools(VNextScheduler.manager_tools(), server.DEFAULT_CATALOG)
+        for name in ("delegate", "replace"):
+            description = next(tool["description"] for tool in tools if tool["name"] == name)
+            with self.subTest(tool=name):
+                self.assertEqual(1, description.count("Worker limits:"))
+                for limit in ("1800", "30 min", "64 MiB", "64 KiB", "API", "browser",
+                              "network restricted", "acknowledge_messages_through", "unread-messages",
+                              "(claude, zai) it is a wall-clock cap", "(codex, commandcode) every turn event renews it",
+                              "~/.codex"):
+                    self.assertIn(limit, description)
+
 
 class RunFolderTests(unittest.TestCase):
+    def test_dispatch_preserves_warnings_when_adding_wake_command(self) -> None:
+        from vnext.vnext_runtime_types import ToolCallResult
+
+        service = object.__new__(VNextMcpService)
+        service._closing = False
+        service.workspace = Path(".")
+        service._session_id = "fake-session"
+        service.session = SimpleNamespace(external_tool_call=lambda **kwargs: ToolCallResult(
+            True, {"agent_id": "fake-child", "warnings": ["turn cap", "no browser"]},
+        ))
+        result = service._dispatch("delegate", {"objective": "Use browser for 90 minutes"}, {})
+        self.assertTrue(result.success)
+        self.assertEqual(["turn cap", "no browser"], result.value["warnings"])
+        self.assertIn("wake_command", result.value)
+
     def test_new_project_run_folder_ignores_its_own_records(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
@@ -384,6 +411,29 @@ class VNextMcpServerTests(unittest.TestCase):
             self.assertEqual(set(tool) - allowed, set(), tool["name"])
             self.assertTrue(tool["description"])
             self.assertEqual("object", tool["inputSchema"]["type"])
+
+
+    def test_tools_list_serves_worker_limits_for_delegate_and_replace(self) -> None:
+        tools = self._call({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
+        for name in ("delegate", "replace"):
+            description = next(tool["description"] for tool in tools if tool["name"] == name)
+            with self.subTest(tool=name):
+                self.assertEqual(1, description.count("Worker limits:"))
+                for limit in ("1800", "30 min", "64 MiB", "64 KiB", "API", "browser",
+                              "network restricted", "acknowledge_messages_through", "unread-messages",
+                              "(claude, zai) it is a wall-clock cap", "(codex, commandcode) every turn event renews it",
+                              "~/.codex"):
+                    self.assertIn(limit, description)
+
+    def test_delegate_warnings_survive_mcp_dispatch(self) -> None:
+        created = self._tool("delegate", {
+            "role": AgentRole.WORKER.value, "model_id": WORKER_MODEL,
+            "objective": "Use playwright for 96 minutes",
+        })
+        self.assertFalse(created["isError"], created)
+        # This worker has no Claude SDK route, so only the browser warning applies.
+        self.assertEqual(1, len(created["structuredContent"]["warnings"]))
+        self.assertEqual(json.loads(created["content"][0]["text"]), created["structuredContent"])
 
     def test_a_client_delegates_and_waits_over_http(self) -> None:
         created = self._tool("delegate", {
@@ -4131,3 +4181,25 @@ class ReadOnlyRunFolderTests(unittest.TestCase):
                 )
             finally:
                 service.close()
+
+ClaudeExecutableResolutionTests.test_the_login_check_runs_the_resolved_path = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(ClaudeExecutableResolutionTests.test_the_login_check_runs_the_resolved_path)
+
+ClaudeLoginTimeoutTests.test_a_timeout_is_unchecked_rather_than_signed_out = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(ClaudeLoginTimeoutTests.test_a_timeout_is_unchecked_rather_than_signed_out)
+
+ClaudeLoginTimeoutTests.test_one_startup_asks_the_claude_cli_once = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(ClaudeLoginTimeoutTests.test_one_startup_asks_the_claude_cli_once)
+
+ClaudeLoginTimeoutTests.test_the_empty_roster_message_says_the_check_did_not_answer = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(ClaudeLoginTimeoutTests.test_the_empty_roster_message_says_the_check_did_not_answer)
+
+ClaudeLoginTimeoutTests.test_the_timeout_is_long_enough_for_a_loaded_machine = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(ClaudeLoginTimeoutTests.test_the_timeout_is_long_enough_for_a_loaded_machine)
+
+ModelRosterTests.test_default_catalog_filters_each_unavailable_provider = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(ModelRosterTests.test_default_catalog_filters_each_unavailable_provider)
+
+ModelRosterTests.test_delegate_and_replace_descriptions_include_worker_limits = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(ModelRosterTests.test_delegate_and_replace_descriptions_include_worker_limits)
+
+StartupCheckTests.test_a_catalog_that_names_no_provider_model_says_so_before_any_login = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(StartupCheckTests.test_a_catalog_that_names_no_provider_model_says_so_before_any_login)
+
+StartupCheckTests.test_configured_providers_absent_from_catalog_say_catalog_names_none = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(StartupCheckTests.test_configured_providers_absent_from_catalog_say_catalog_names_none)
+
+VNextMcpServerTests.test_bad_claude_effort_is_a_tool_error_without_a_spawn_record = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(VNextMcpServerTests.test_bad_claude_effort_is_a_tool_error_without_a_spawn_record)
+
+VNextMcpServerTests.test_tools_list_serves_worker_limits_for_delegate_and_replace = __import__('unittest').skip('Private Claude worker test is excluded from the public build.')(VNextMcpServerTests.test_tools_list_serves_worker_limits_for_delegate_and_replace)

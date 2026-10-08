@@ -1,7 +1,7 @@
 {
   "name": "vnext-session-record",
   "description": "Records the host session's own subagents, per-request model and usage to .vnext/host/<session-id>.jsonl (in the project, or under ~/.vnext/host/), with no prompt text, and shows them in the /vnext pane.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "RazAndAlex"
   }
