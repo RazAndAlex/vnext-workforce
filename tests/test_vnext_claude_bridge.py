@@ -5805,6 +5805,37 @@ class DeferredReleaseCarriesTheFinalUsageTests(unittest.TestCase):
         self.assertIn("ready", asked)
         self.assertEqual({self.THREAD: False, "ready": True}, received)
 
+    def test_a_stalled_reservation_that_overruns_its_share_still_leaves_the_sibling_one_ask(self) -> None:
+        """A slow host oversleeps a request deadline; the sibling is still asked.
+
+        GitHub's macOS runners returned from the stalled request after the whole
+        budget was gone, and the ready sibling was skipped.  The overrun here is
+        made explicit so the test does not depend on the host's timer.
+        """
+
+        adapter = self._adapter()
+        adapter._threads["ready"] = dict(adapter._threads[self.THREAD])
+        asked: list[str] = []
+
+        def request(_op, payload, **kwargs):
+            name = payload["reservation_id"]
+            asked.append(name)
+            if name == self.THREAD:
+                time.sleep(kwargs["timeout_seconds"] + 0.3)
+                return {"reservation_echo": name, "released": False, "terminal_owner": False}
+            adapter._events.append({"name": "usage", "reservation_id": name,
+                                    "usage": {"totalTokens": 100}, "total_cost_usd": 0.01})
+            return {"reservation_echo": name, "released": True, "terminal_owner": False}
+
+        with patch.object(adapter, "_request", side_effect=request):
+            for thread_id in (self.THREAD, "ready"):
+                adapter._threads[thread_id]["release_deferred"] = True
+                adapter._threads[thread_id]["release_status"] = "completed"
+            received = adapter.await_pending_usage_releases(0.3)
+
+        self.assertEqual([self.THREAD, "ready"], asked)
+        self.assertEqual({self.THREAD: False, "ready": True}, received)
+
 
 class AnErrorCodeThatIsNotTextTests(unittest.TestCase):
     """R18: a list or an object as an error code raised TypeError.

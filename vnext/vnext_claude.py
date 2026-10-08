@@ -843,6 +843,11 @@ class ClaudeCodeAdapter:
             self._usage_release_failures.pop(thread_id, None)
         given_up: set[str] = set()
         ends_at = time.monotonic() + max(0.0, float(budget_seconds))
+        # Every reservation is asked at least once, even when a stalled sibling
+        # ahead of it overran its share.  A slow host oversleeps a request
+        # deadline (seen on GitHub's macOS runners), and the budget check alone
+        # then skipped the ready sibling whose bill was already queued.
+        asked_once: set[str] = set()
         while True:
             outstanding = [
                 thread_id for thread_id in pending
@@ -850,8 +855,9 @@ class ClaudeCodeAdapter:
             ]
             for position, thread_id in enumerate(outstanding):
                 remaining = ends_at - time.monotonic()
-                if remaining <= 0:
+                if remaining <= 0 and thread_id in asked_once:
                     break
+                asked_once.add(thread_id)
                 state = self._threads.get(thread_id)
                 if not isinstance(state, dict):
                     given_up.add(thread_id)
@@ -871,7 +877,10 @@ class ClaudeCodeAdapter:
                     self.release_terminal_thread(
                         thread_id,
                         status=str(state.get("release_status") or "completed"),
-                        timeout_seconds=min(self._timeout, remaining, share),
+                        timeout_seconds=min(
+                            self._timeout,
+                            max(min(remaining, share), _PENDING_USAGE_POLL_SECONDS),
+                        ),
                     )
                 except Exception as exc:
                     # Every fault leaves a reason behind, named after its cause.
