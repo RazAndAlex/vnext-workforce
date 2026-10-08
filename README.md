@@ -3,12 +3,16 @@
 [![ci](https://github.com/RazAndAlex/vnext-workforce/actions/workflows/ci.yml/badge.svg)](https://github.com/RazAndAlex/vnext-workforce/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-vNext lets Claude Code hand jobs to other AI agents, and it keeps a record of
-what each agent did. We call these agents workers.
+[![A 16-second clip of one real job: Claude Code gives a worker a task, vNext starts three workers on Codex, Z.ai and Command Code, each finishes with its time, tokens and cost, vNext writes the record to .vnext/ and wakes Claude Code with the report](docs/vnext-0.3.0.gif)](docs/vnext-0.3.0.mp4)
 
-You talk to Claude Code as usual. When a job suits a worker, Claude Code starts
-one, waits for it and reads what it returned. Claude Code stays in charge. It
-keeps its own conversation, its own permissions and its own login.
+vNext lets Claude Code hand work to other AI agents, called workers. Each
+worker runs on the model you choose, in your project, and several can run at
+the same time. vNext keeps a record of every worker: the model, the time, the
+tokens and what it reported.
+
+You talk to Claude Code as usual. It stays in charge, with its own chat,
+permissions and login. It decides what each worker does and checks what comes
+back.
 
 ## One job, start to finish
 
@@ -16,27 +20,32 @@ You type this in Claude Code:
 
 ```
 Use vNext to give a worker this job: read README.md and list every
-command it tells a user to run. Wait for it, then show me what came back.
+command it tells a user to run. Tell me when it is done.
 ```
 
-![One job: you ask Claude Code, Claude Code delegates to vNext, vNext starts workers, they answer, vNext writes a record into .vnext/ and hands the answers back to Claude Code](docs/one-job.svg)
+![One job: you ask Claude Code, Claude Code delegates to vNext, vNext starts a worker on Codex, Z.ai or Command Code, the worker answers, vNext writes a record into .vnext/ and wakes Claude Code with the report](docs/one-job.svg)
 
-The record says which worker ran, on which model, for how long and with how
-many tokens. It stays in your project.
+1. Claude Code calls `delegate`. The reply shows the limits of the chosen
+   worker. It also warns you when the job does not fit those limits, for
+   example a time budget longer than one turn or a job that needs a browser.
+2. vNext starts the worker. Workers run on OpenAI Codex with your own login.
+   They also run on Z.ai or Command Code with an API key. See [Models](#models).
+3. When the worker stops, vNext wakes Claude Code with the worker's report.
+   Claude Code does not have to wait. The wake also works for a worker that
+   Claude Code retries or replaces.
+4. Claude Code reads the report and acts on it. It can read the whole record,
+   send the worker a message, steer it, retry it, replace it, approve its
+   request or stop it.
+5. The record stays in your project. It shows which worker ran, on which model,
+   for how long and with how many tokens. See [Where the records go](#records).
 
-## What it does
+Claude work stays with Claude Code's own subagents. See
+[Why vNext has no Claude workers](#no-claude).
 
-- Starts workers on OpenAI Codex with your own login, and on Z.ai or Command
-  Code with an API key. See [Models](#models).
-- Leaves Claude work to Claude Code's own subagents. See
-  [Why vNext has no Claude workers](#no-claude).
-- Lets Claude Code wait for a worker, send it a message, stop it or retry it.
-- Writes a record of every worker into your project. See
-  [Where the records go](#records).
-- Tells you when a newer Codex CLI or Claude Agent SDK is out, and installs it
-  when you ask. See [Keeping up with new models](#new-models).
-- Explains a failed worker with one command. See
-  [When a worker fails](#failures).
+`vnext-mcp --check` lists the models that you can reach. A failed worker has
+its own page: [When a worker fails](#failures). vNext also tells you when a
+newer Codex CLI or Claude Agent SDK is out. See
+[Keeping up with new models](#new-models).
 
 ## What you need
 
